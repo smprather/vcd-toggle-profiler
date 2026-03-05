@@ -54,10 +54,17 @@
   the first integer multiple of the step size <= the specified start time.
   --start-time `time_value[si_prefix]s`
   --stop-time `time_value[si_prefix]s`
+- Add a --debug option to create a csv file containing these columns: time, toggle_rate,
+  cumulative_toggle_count. put the units in parentheticals after the column header text. example: time(ns),toggle_rate(toggles/ns),cumulative_toggle_count
 
 ## Implementation Notes
 
 - Make the input file a positional argument.
+- Arrange the uPlot legend in a vertical stack, left-justified.
+- For the cumulative plot, keep track of the cumumative toggle count for every
+  timestep. Plot all time step values. Downsample as needed. Do not process for peak
+  preservation since cumulative is always monotonic rising.
+- Prefer using pigz over gzip, when available.
 
 ## Priorities
 

@@ -48,6 +48,7 @@ struct Options {
   uint64_t stop_fs = 0;
 
   bool allow_top_window_overlap = false;
+  bool debug = false;
   uint64_t max_points = 200000;
 
   std::string uplot_js_path;
@@ -950,6 +951,7 @@ int ParseOptions(int argc, char** argv, Options* opts) {
                  overlap_text,
                  "Allow overlap among selected top windows (true|false)")
       ->default_val(overlap_text);
+  app.add_flag("--debug", opts->debug, "Write debug CSV with time,toggle_rate,cumulative_toggle_count");
   app.add_option("--title", opts->title, "Report title (default: input basename)");
   app.add_option("--max-points", opts->max_points, "Max rendered plot points (0 disables downsampling)")
       ->default_val(opts->max_points);
@@ -1372,13 +1374,33 @@ PlotData DownsamplePlotData(const PlotData& input, uint64_t max_points) {
         max_rate_idx = j;
       }
     }
+    const size_t last_idx = end - 1;
 
-    out.x_values.push_back(input.x_values[max_rate_idx]);
+    out.x_values.push_back(input.x_values[last_idx]);
     out.y_rate.push_back(input.y_rate[max_rate_idx]);
-    out.y_cumulative.push_back(input.y_cumulative[max_rate_idx]);
+    out.y_cumulative.push_back(input.y_cumulative[last_idx]);
   }
 
   return out;
+}
+
+void WriteDebugCsv(const fs::path& path, const PlotData& plot, const Options& opts) {
+  std::ofstream out(path, std::ios::out | std::ios::trunc);
+  if (!out) {
+    throw std::runtime_error("failed to write debug CSV: " + path.string());
+  }
+
+  out << "time(" << plot.x_unit_label << "),"
+      << "toggle_rate(toggles/" << opts.rate_unit_label << "),"
+      << "cumulative_toggle_count\n";
+  for (size_t i = 0; i < plot.x_values.size(); ++i) {
+    const uint64_t cumulative_count = static_cast<uint64_t>(
+        std::llround(plot.y_cumulative[i] * plot.cumulative_unit_scale));
+
+    out << std::fixed << std::setprecision(9) << plot.x_values[i] << ','
+        << std::fixed << std::setprecision(9) << plot.y_rate[i] << ','
+        << cumulative_count << '\n';
+  }
 }
 
 void WriteSignalList(const fs::path& path, const std::vector<SignalState>& signals) {
@@ -1513,6 +1535,11 @@ void WriteHtmlReport(const fs::path& out_path,
       << "  <style>\n"
       << uplot_css << "\n"
       << "  </style>\n"
+      << "  <style>\n"
+      << "    .uplot .u-legend{margin:8px 0 0 0;text-align:left;}\n"
+      << "    .uplot .u-legend.u-inline tr{display:table-row;margin-right:0;}\n"
+      << "    .uplot .u-legend.u-inline th,.uplot .u-legend.u-inline td{display:table-cell;}\n"
+      << "  </style>\n"
       << "</head>\n"
       << "<body>\n"
       << "  <div>Double-click LMB to zoom-full</div>\n"
@@ -1612,7 +1639,7 @@ void WriteHtmlReport(const fs::path& out_path,
     if (i > 0) {
       out << ',';
     }
-    out << std::fixed << std::setprecision(0) << plot.y_cumulative[i];
+    out << std::fixed << std::setprecision(9) << plot.y_cumulative[i];
   }
   out << "];\n";
 
@@ -1703,10 +1730,14 @@ int main(int argc, char** argv) {
     const fs::path signal_list_path = outdir / "signals.txt";
     const fs::path signal_csv_path = outdir / "signal_toggle_counts.csv";
     const fs::path top_windows_path = outdir / "top_20_windows.txt";
+    const fs::path debug_csv_path = outdir / "debug.csv";
 
     WriteSignalList(signal_list_path, parser.signals());
     WriteSignalCsv(signal_csv_path, parser.signals());
     WriteTopWindows(top_windows_path, top_windows);
+    if (opts.debug) {
+      WriteDebugCsv(debug_csv_path, plot, opts);
+    }
 
     const auto js_path = ResolveAssetPath(opts.uplot_js_path, fs::path("third_party/uplot/uPlot.iife.js"));
     const auto css_path = ResolveAssetPath(opts.uplot_css_path, fs::path("third_party/uplot/uPlot.min.css"));
@@ -1740,6 +1771,9 @@ int main(int argc, char** argv) {
               << "Signals list: " << signal_list_path.string() << "\n"
               << "Signal CSV: " << signal_csv_path.string() << "\n"
               << "Top windows: " << top_windows_path.string() << "\n";
+    if (opts.debug) {
+      std::cout << "Debug CSV: " << debug_csv_path.string() << "\n";
+    }
 
     if (opts.has_start_time) {
       std::cout << "Start time requested: " << opts.start_fs << " fs\n"
