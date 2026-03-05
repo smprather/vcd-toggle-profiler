@@ -1,89 +1,150 @@
-# vcd-toggle-profiler
+# VCD Toggle Profiler
 
-Profiles total VCD toggle-count vs. time and writes a static HTML report with embedded uPlot (offline, no CDN).
+A high-performance command-line tool that profiles signal toggle activity in
+[Value Change Dump (VCD)](https://en.wikipedia.org/wiki/Value_change_dump) files
+and produces a self-contained HTML report with interactive charts.
+
+Feed it a VCD from your RTL simulation; get back a plot of toggle rate vs. time,
+a cumulative toggle count curve, per-signal statistics, and the hottest toggle
+windows — all in a single offline HTML file powered by
+[uPlot](https://github.com/leeoniya/uPlot).
 
 ## Features
 
-- Streaming VCD parser (`$scope`, `$var`, scalar/vector value changes)
-- Sliding-window toggle profile with separate window and step sizes
-- Window semantics: `(t_left, t_right]` with `t_left = max(0, t_right - win_size)`
-- Auto-selected x-axis time unit (`fs/ps/ns/us/ms/s`) for readability
-- Primary plot: toggle rate = `toggles_in_window / effective_window_size_at_step`
-- Secondary plot: cumulative total toggle count with auto-selected readable count units
-- HTML info section rendered as a table
-- HTML third section with top-20 toggle windows table
-- `.vcd` and `.vcd.gz` input support (`.gz` recognized by suffix)
-- Signal preamble filter (`--preamble`) with case-sensitive prefix match
-- Alias deduplication by VCD identifier (same id counted once in totals and per-signal outputs)
-- Additional output files: sorted signal list, per-signal toggle CSV, top-20 windows text table
-- Static HTML report with vendored `uPlot` assets
+- **Streaming VCD parser** — processes files line-by-line; never loads the whole
+  file into memory. Targets < 0.5 GB RAM even on massive inputs.
+- **Gzip support** — reads `.vcd.gz` files transparently (pipes through `gzip -d`).
+- **Stdin support** — pass `-` as the input to read from a pipe.
+- **Sliding-window toggle rate** — configurable window and step sizes with
+  half-open `(t_left, t_right]` semantics.
+- **Dual-axis HTML report** — primary axis shows toggle rate
+  (toggles / user-chosen time unit); secondary axis shows cumulative toggle count.
+  Auto-selected human-readable units on both axes.
+- **Top-20 hottest windows** — with optional non-overlapping constraint.
+- **Signal filtering** — `--preamble` retains only signals whose fully qualified
+  name starts with a given prefix (prefix is stripped in output).
+- **Alias deduplication** — VCD identifiers that map to the same signal are
+  counted once.
+- **Downsampling** — large traces are downsampled to `--max-points` for fast
+  rendering while preserving peaks on the rate series.
+- **Fully offline** — all dependencies (uPlot JS/CSS, CLI11) are vendored.
+  No network access required to build or run.
 
-## Build (Offline)
+## Build
 
-Prerequisite: C++17 compiler, CMake, and `gzip` runtime command for `.gz` input.
+Requirements: a C++17 compiler, CMake >= 3.16, and `gzip` on `$PATH` for `.gz`
+input.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake --build build -j$(nproc)
 ```
 
-Binary:
+The binary is written to `./build/vcd-toggle-profiler`.
+
+## Quick start
 
 ```bash
-./build/vcd-toggle-profiler
-```
+# Basic run — writes report to output/toggle_profile.html
+./build/vcd-toggle-profiler vcd-samples/random/random.vcd
 
-## Usage
-
-```bash
-./build/vcd-toggle-profiler \
-  vcd-samples/random/random.vcd \
-  --outdir output \
+# Custom window, step, time range, and output directory
+./build/vcd-toggle-profiler vcd-samples/swerv/swerv1.vcd \
+  --outdir swerv-out \
   --win-size 500ps \
   --step-size 50ps \
   --start-time 1ns \
   --stop-time 200ns \
   --rate-unit ns
+
+# Gzipped input
+./build/vcd-toggle-profiler vcd-samples/Briey/dump1.vcd.gz
+
+# Pipe from another tool
+zcat huge.vcd.gz | ./build/vcd-toggle-profiler - --title "Huge design"
 ```
 
-## CLI Options
+## CLI reference
 
-- `<input>` required positional input path (`file.vcd`, `file.vcd.gz`, or `-` for stdin)
-- `--outdir <dir>` output directory (default: `output`)
-- `--win-size <duration>` sliding window size (default: `500ps`)
-- `--step-size <duration>` step size (default: `50ps`)
-- `--start-time <duration>` optional time-range start for plotted/selected windows; snapped down to the nearest step boundary
-- `--stop-time <duration>` optional time-range stop for plotted/selected windows
-- `--rate-unit <unit>` rate denominator unit for y-axis label/rate calculation (default: `ns`)
-- `--preamble <prefix>` retain only signals whose FQSN starts with this case-sensitive prefix; prefix is removed in outputs
-- `--allow-top-window-overlap <true|false>` overlap policy for top-20 windows (default: `false`)
-- `--title <text>` report title
-- `--max-points <n>` max rendered plot points in HTML (default: `200000`, `0` disables downsampling)
-- `--uplot-js <path>` override vendored uPlot JS path
-- `--uplot-css <path>` override vendored uPlot CSS path
+```
+USAGE:  vcd-toggle-profiler <input> [OPTIONS]
+```
 
-Duration units accepted for `--win-size`, `--step-size`, `--start-time`, and `--stop-time`: `fs`, `ps`, `ns`, `us`, `ms`, `s`.
-Units accepted for `--rate-unit`: `fs`, `ps`, `ns`, `us`, `ms`, `s`.
+| Option | Description | Default |
+|--------|-------------|---------|
+| `<input>` | Input VCD path (`.vcd`, `.vcd.gz`, or `-` for stdin) | *required* |
+| `--outdir <dir>` | Output directory | `output` |
+| `--win-size <dur>` | Sliding window size | `500ps` |
+| `--step-size <dur>` | Step size between successive windows | `50ps` |
+| `--start-time <dur>` | Start of the analysis range (snapped down to step boundary) | *beginning of trace* |
+| `--stop-time <dur>` | End of the analysis range | *end of trace* |
+| `--rate-unit <unit>` | Time unit for the rate denominator (y-axis) | `ns` |
+| `--preamble <prefix>` | Keep only signals whose FQSN starts with this prefix (prefix is removed in output) | *none* |
+| `--allow-top-window-overlap <true\|false>` | Allow overlapping windows in the top-20 table | `false` |
+| `--title <text>` | Report title (defaults to input filename) | |
+| `--max-points <n>` | Max rendered data points in the HTML chart (`0` = unlimited) | `200000` |
+| `--debug` | Write a `debug.csv` with per-step rate and cumulative count | |
+| `--uplot-js <path>` | Override vendored uPlot JS | |
+| `--uplot-css <path>` | Override vendored uPlot CSS | |
 
-Constraints:
+**Duration format:** a number followed by a unit — `fs`, `ps`, `ns`, `us`, `ms`, or `s`.
+Examples: `100ps`, `1ns`, `500us`.
 
-- `step_size <= win_size`
-- `win_size % step_size == 0`
-- `stop_time >= snapped_start_time` when both are set
+**Constraints:**
+- `step_size` must be ≤ `win_size`
+- `win_size` must be evenly divisible by `step_size`
+- When both are set, `stop_time` must be ≥ the snapped `start_time`
 
-## Output Files
+## Output files
 
-Written under `--outdir`:
+All files are written under the `--outdir` directory:
 
-- `toggle_profile.html`
-- `signals.txt` (sorted by hierarchy depth, then leaf-name length, then lexicographic)
-- `signal_toggle_counts.csv` (`signal_name,total_toggle_count`, reverse-sorted by total toggle count)
-- `top_20_windows.txt` (space-separated table: `rank left_ps right_ps total_toggles toggle_rate_per_ns`)
+| File | Contents |
+|------|----------|
+| `toggle_profile.html` | Self-contained interactive report (dual-axis chart, info table, top-20 windows table) |
+| `signals.txt` | All matched signals, sorted by hierarchy depth then leaf-name length then lexicographic |
+| `signal_toggle_counts.csv` | `signal_name,total_toggle_count` — reverse-sorted by count |
+| `top_20_windows.txt` | Space-aligned table: `rank left_ps right_ps total_toggles toggle_rate_per_ns` |
+| `debug.csv` | *(only with `--debug`)* `time(<unit>),toggle_rate(toggles/<rate_unit>),cumulative_toggle_count` |
+
+## Sample VCD files
+
+The `vcd-samples/` directory contains test data at various scales:
+
+| Directory | Description | Size |
+|-----------|-------------|------|
+| `random/` | Tiny 8-bit counter | ~3 KB |
+| `jtag/` | Small JTAG controller | ~50 KB |
+| `bgm434/` | Pipelined pow-5 design | ~1.5 MB |
+| `swerv/` | RISC-V SweRV core | ~14 MB |
+| `Briey/` | VexRiscv Briey SoC (gzipped) | ~5 MB compressed |
+
+## How it works
+
+1. **Header parse** — reads VCD `$scope` / `$var` / `$upscope` declarations to
+   build a signal table keyed by VCD identifier code. Applies `--preamble`
+   filtering and deduplicates aliases.
+2. **Streaming value-change scan** — reads the VCD body line by line, tracking
+   the current simulation time. On each value change, compares the new value
+   against the signal's previous value to count bit-level toggles.
+3. **Windowed aggregation** — maintains a circular buffer of per-step toggle
+   counts. At each step boundary, computes the toggle rate
+   (`window_toggles / effective_window_size`) and the running cumulative count.
+4. **Top-window selection** — sorts all windows by total toggles; greedily
+   selects the top 20 (optionally enforcing non-overlap).
+5. **Report generation** — emits a static HTML file with vendored uPlot JS/CSS
+   inlined, two y-axis series, an info table, and the top-20 windows table.
+   Large series are downsampled (with peak preservation on the rate axis) to
+   stay within `--max-points`.
 
 ## Vendored dependencies
 
-- `third_party/uplot/uPlot.iife.js`
-- `third_party/uplot/uPlot.min.css`
-- `third_party/uplot/LICENSE-uPlot.txt`
-- `third_party/CLI11/include/CLI/*.hpp`
-- `third_party/CLI11/LICENSE-CLI11.txt`
+All third-party code is checked into the repository so the project builds
+fully offline:
+
+- **[uPlot](https://github.com/leeoniya/uPlot)** v1.6.16 — `third_party/uplot/`
+- **[CLI11](https://github.com/CLIUtils/CLI11)** — `third_party/CLI11/`
+
+## License
+
+[MIT](LICENSE) — Copyright (c) 2026 Myles Prather
