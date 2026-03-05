@@ -12,14 +12,13 @@ windows — all in a single offline HTML file powered by
 ## Features
 
 - **Streaming VCD parser** — processes files line-by-line; never loads the whole
-  file into memory. Targets < 0.5 GB RAM even on massive inputs.
-- **Gzip support** — reads `.vcd.gz` files transparently (pipes through `gzip -d`).
-- **Stdin support** — pass `-` as the input to read from a pipe.
+  file into memory.
 - **Sliding-window toggle rate** — configurable window and step sizes with
   half-open `(t_left, t_right]` semantics.
 - **Dual-axis HTML report** — primary axis shows toggle rate
-  (toggles / user-chosen time unit); secondary axis shows cumulative toggle count.
-  Auto-selected human-readable units on both axes.
+  (toggles/time)
+- Secondary axis shows cumulative toggle count.
+- **Auto-selected human-readable** units on both axes.
 - **Top-20 hottest windows** — with optional non-overlapping constraint.
 - **Signal filtering** — `--preamble` retains only signals whose fully qualified
   name starts with a given prefix (prefix is stripped in output).
@@ -29,6 +28,8 @@ windows — all in a single offline HTML file powered by
   rendering while preserving peaks on the rate series.
 - **Fully offline** — all dependencies (uPlot JS/CSS, CLI11) are vendored.
   No network access required to build or run.
+- **Gzip support** — reads `.vcd.gz` files transparently (pipes through `gzip -d`).
+- **Stdin support** — pass `-` as the input to read from a pipe.
 
 ## Build
 
@@ -66,7 +67,7 @@ zcat huge.vcd.gz | ./build/vcd-toggle-profiler - --title "Huge design"
 
 ## CLI reference
 
-```
+```text
 USAGE:  vcd-toggle-profiler <input> [OPTIONS]
 ```
 
@@ -91,6 +92,7 @@ USAGE:  vcd-toggle-profiler <input> [OPTIONS]
 Examples: `100ps`, `1ns`, `500us`.
 
 **Constraints:**
+
 - `step_size` must be ≤ `win_size`
 - `win_size` must be evenly divisible by `step_size`
 - When both are set, `stop_time` must be ≥ the snapped `start_time`
@@ -117,7 +119,7 @@ The `vcd-samples/` directory contains test data at various scales:
 | `jtag/` | Small JTAG controller | ~50 KB |
 | `bgm434/` | Pipelined pow-5 design | ~1.5 MB |
 | `swerv/` | RISC-V SweRV core | ~14 MB |
-| `Briey/` | VexRiscv Briey SoC (gzipped) | ~5 MB compressed |
+| `Briey/` | VexRiscv Briey SoC | ~270 MB |
 
 ## How it works
 

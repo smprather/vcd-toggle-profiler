@@ -4,33 +4,61 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-VCD Toggle Profiler — profiles total toggle-count vs. time for signals in Value Change Dump (VCD) files. Outputs a static HTML file with an embedded [uPlot](https://github.com/leeoniya/uPlot) chart (no CDN). Lots of other data processing and output statistics.
+VCD Toggle Profiler — profiles total toggle-count vs. time for signals in Value Change Dump (VCD) files. Outputs a static HTML file with an embedded [uPlot](https://github.com/leeoniya/uPlot) chart (no CDN), plus per-signal CSV, sorted signal list, and top-20 windows table.
 
 ## Status
 
-Pre-implementation. The repository contains architecture docs (`doc/architecture.md`) and sample VCD files (`vcd-samples/`) but no source code yet.
+Implemented and functional. Single-file C++ implementation in `src/main.cpp` (~1500 lines). Builds with CMake and runs against included sample VCD files.
+
+## Build
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+# Binary: ./build/vcd-toggle-profiler
+```
 
 ## Tech Stack
 
-- **C++** for the core parser/profiler
-- **uPlot** (JavaScript) embedded in generated HTML output
-- `.gitignore` is currently Rust/Cargo-based (likely needs updating for C++)
+- **C++17** — single-file implementation (`src/main.cpp`)
+- **CMake** >= 3.16 — build system (`CMakeLists.txt`)
+- **CLI11** — command-line parsing (vendored in `third_party/CLI11/`)
+- **uPlot** v1.6.16 — chart library inlined into HTML output (vendored in `third_party/uplot/`)
+- **gzip/pigz** — runtime dependency for `.vcd.gz` decompression (pigz preferred when available)
+
+## Project Structure
+
+- `src/main.cpp` — entire application (parser, profiler, HTML generator)
+- `doc/architecture.md` — design spec and feature requirements
+- `third_party/` — vendored CLI11 and uPlot (fully offline build)
+- `vcd-samples/` — test VCD files at various scales
+- `build/` — CMake build directory (gitignored)
+- `output/` — default output directory (gitignored)
 
 ## Architecture & Design Constraints
 
 See `doc/architecture.md` for full details. Key requirements:
 
 - **Performance**: Handle >200GB compressed VCD files in <2 hours
-- **Memory**: Stream-process blocks from disk; never load whole file; stay under 0.5GB RAM
+- **Memory**: Stream-process lines from disk; never load whole file; stay under 0.5 GB RAM
 - **Parsing**: Minimize allocations in tight loops; use static buffers for line processing
-- **Output**: Static HTML with embedded uPlot JS (no CDN references)
-- **Windowing**: 100ps windows for toggle counting
+- **Output**: Static HTML with embedded uPlot JS/CSS (no CDN references)
+- **Offline**: All dependencies vendored; no network access needed to build or run
+
+## Key Concepts
+
+- **FQSN** — Fully Qualified Signal Name (dot-separated hierarchy, e.g. `i1.i2.foo`)
+- **Window semantics** — half-open `(t_left, t_right]` where `t_left = max(0, t_right - win_size)`
+- **Toggle rate** — `window_toggles / effective_window_size` at each step
+- **Duration units** — `fs`, `ps`, `ns`, `us`, `ms`, `s` (internally all converted to femtoseconds)
+- **Alias dedup** — multiple VCD signal names sharing the same identifier code are counted once
 
 ## Sample VCD Files
 
 `vcd-samples/` contains test data of varying complexity:
 
-- `random/` — tiny counter (~3KB), good for basic testing
-- `jtag/` — small JTAG controller
-- `swerv/` — RISC-V SweRV core (~14MB), good stress test
-- `Briey/` and `bgm434/` — compressed with Brotli (`.vcd.br`)
+- `random/` — tiny 8-bit counter (~3 KB), good for basic testing
+- `jtag/` — small JTAG controller (~50 KB)
+- `bgm434/` — pipelined pow-5 design (~1.5 MB)
+- `swerv/` — RISC-V SweRV core (gzipped, ~14 MB uncompressed), good stress test
+- `Briey/` — VexRiscv Briey SoC (gzipped)
