@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -56,7 +57,6 @@ struct Options {
 };
 
 struct SignalState {
-  std::string fqsn;
   std::string output_name;
   std::string leaf_name;
   size_t depth = 0;
@@ -93,7 +93,6 @@ struct TopWindow {
   uint64_t right_fs = 0;
   uint64_t effective_window_fs = 0;
   uint64_t window_toggles = 0;
-  uint64_t cumulative_toggles = 0;
   double rate = 0.0;
 };
 
@@ -103,6 +102,43 @@ struct InputHandle {
   pid_t gzip_pid = -1;
 };
 
+constexpr size_t kInputBufferSize = 1 << 20;
+
+struct FastU64Hash {
+  size_t operator()(uint64_t x) const noexcept {
+    x ^= (x >> 33);
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= (x >> 33);
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= (x >> 33);
+    return static_cast<size_t>(x);
+  }
+};
+
+struct FastStringViewHash {
+  size_t operator()(std::string_view sv) const noexcept {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (char c : sv) {
+      h ^= static_cast<unsigned char>(c);
+      h *= 0x100000001b3ULL;
+    }
+    return static_cast<size_t>(h);
+  }
+};
+
+struct FastStringViewEq {
+  bool operator()(std::string_view a, std::string_view b) const noexcept {
+    return a == b;
+  }
+};
+
+using U64SignedMap = std::unordered_map<uint64_t, int64_t, FastU64Hash>;
+using U64Map = std::unordered_map<uint64_t, uint64_t, FastU64Hash>;
+using StringViewIndexMap =
+    std::unordered_map<std::string_view, size_t, FastStringViewHash, FastStringViewEq>;
+using StringViewSet =
+    std::unordered_set<std::string_view, FastStringViewHash, FastStringViewEq>;
+
 bool StartsWith(std::string_view s, std::string_view prefix) {
   return s.size() >= prefix.size() && s.substr(0, prefix.size()) == prefix;
 }
@@ -111,18 +147,26 @@ bool EndsWith(std::string_view s, std::string_view suffix) {
   return s.size() >= suffix.size() && s.substr(s.size() - suffix.size()) == suffix;
 }
 
+inline bool IsAsciiSpace(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+inline bool IsAsciiDigit(char c) {
+  return c >= '0' && c <= '9';
+}
+
 std::string_view Trim(std::string_view s) {
-  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
+  while (!s.empty() && IsAsciiSpace(s.front())) {
     s.remove_prefix(1);
   }
-  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
+  while (!s.empty() && IsAsciiSpace(s.back())) {
     s.remove_suffix(1);
   }
   return s;
 }
 
 void SkipWs(const char*& p) {
-  while (*p != '\0' && std::isspace(static_cast<unsigned char>(*p))) {
+  while (*p != '\0' && IsAsciiSpace(*p)) {
     ++p;
   }
 }
@@ -130,54 +174,105 @@ void SkipWs(const char*& p) {
 std::string_view ReadToken(const char*& p) {
   SkipWs(p);
   const char* begin = p;
-  while (*p != '\0' && !std::isspace(static_cast<unsigned char>(*p))) {
+  while (*p != '\0' && !IsAsciiSpace(*p)) {
     ++p;
   }
   return std::string_view(begin, static_cast<size_t>(p - begin));
 }
 
 char NormalizeLogicChar(char c) {
-  const char lc = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  switch (lc) {
+  switch (c) {
     case '0':
+      return '0';
     case '1':
+      return '1';
     case 'x':
+    case 'X':
+      return 'x';
     case 'z':
-      return lc;
+    case 'Z':
+      return 'z';
     default:
       return 'x';
   }
 }
 
-std::string NormalizeValue(std::string_view raw, uint32_t width) {
+void FillNormalizedValue(std::string* dst, std::string_view raw) {
+  const size_t width = dst->size();
   if (width == 0) {
-    width = 1;
+    return;
   }
+
+  char* out = dst->data();
 
   if (width == 1) {
-    if (raw.empty()) {
-      return std::string(1, 'x');
-    }
-    return std::string(1, NormalizeLogicChar(raw.back()));
+    out[0] = raw.empty() ? 'x' : NormalizeLogicChar(raw.back());
+    return;
   }
-
-  std::string out(width, '0');
-  const char fill = raw.empty() ? 'x' : NormalizeLogicChar(raw.front());
 
   if (raw.size() >= width) {
     const size_t offset = raw.size() - width;
     for (size_t i = 0; i < width; ++i) {
       out[i] = NormalizeLogicChar(raw[offset + i]);
     }
-    return out;
+    return;
   }
 
+  const char fill = raw.empty() ? 'x' : NormalizeLogicChar(raw.front());
   const size_t pad = width - raw.size();
-  std::fill(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(pad), fill);
+  std::fill(out, out + static_cast<std::ptrdiff_t>(pad), fill);
   for (size_t i = 0; i < raw.size(); ++i) {
     out[pad + i] = NormalizeLogicChar(raw[i]);
   }
-  return out;
+}
+
+uint64_t CountTogglesAndUpdate(std::string* dst, std::string_view raw) {
+  const size_t width = dst->size();
+  if (width == 0) {
+    return 0;
+  }
+
+  char* cur = dst->data();
+  uint64_t toggles = 0;
+
+  if (width == 1) {
+    const char next = raw.empty() ? 'x' : NormalizeLogicChar(raw.back());
+    if (cur[0] != next) {
+      cur[0] = next;
+      return 1;
+    }
+    return 0;
+  }
+
+  if (raw.size() >= width) {
+    const size_t offset = raw.size() - width;
+    for (size_t i = 0; i < width; ++i) {
+      const char next = NormalizeLogicChar(raw[offset + i]);
+      if (cur[i] != next) {
+        cur[i] = next;
+        ++toggles;
+      }
+    }
+    return toggles;
+  }
+
+  const char fill = raw.empty() ? 'x' : NormalizeLogicChar(raw.front());
+  const size_t pad = width - raw.size();
+  for (size_t i = 0; i < pad; ++i) {
+    if (cur[i] != fill) {
+      cur[i] = fill;
+      ++toggles;
+    }
+  }
+  for (size_t i = 0; i < raw.size(); ++i) {
+    const char next = NormalizeLogicChar(raw[i]);
+    const size_t idx = pad + i;
+    if (cur[idx] != next) {
+      cur[idx] = next;
+      ++toggles;
+    }
+  }
+  return toggles;
 }
 
 bool ParseUint64(std::string_view token, uint64_t* out) {
@@ -186,7 +281,7 @@ bool ParseUint64(std::string_view token, uint64_t* out) {
   }
   uint64_t value = 0;
   for (char c : token) {
-    if (!std::isdigit(static_cast<unsigned char>(c))) {
+    if (!IsAsciiDigit(c)) {
       return false;
     }
     const uint64_t digit = static_cast<uint64_t>(c - '0');
@@ -260,7 +355,7 @@ bool ParseDurationToFs(std::string_view text, uint64_t* fs_value, std::string* e
   }
 
   size_t split = 0;
-  while (split < text.size() && std::isdigit(static_cast<unsigned char>(text[split]))) {
+  while (split < text.size() && IsAsciiDigit(text[split])) {
     ++split;
   }
 
@@ -293,7 +388,7 @@ bool ParseNonNegativeDurationToFs(std::string_view text, uint64_t* fs_value, std
   }
 
   size_t split = 0;
-  while (split < text.size() && std::isdigit(static_cast<unsigned char>(text[split]))) {
+  while (split < text.size() && IsAsciiDigit(text[split])) {
     ++split;
   }
 
@@ -351,7 +446,7 @@ bool ParseTimescaleFs(const std::string& raw, uint64_t* out_fs, std::string* err
   }
 
   size_t split = 0;
-  while (split < number_tok.size() && std::isdigit(static_cast<unsigned char>(number_tok[split]))) {
+  while (split < number_tok.size() && IsAsciiDigit(number_tok[split])) {
     ++split;
   }
 
@@ -469,10 +564,9 @@ std::string ReadTextFile(const fs::path& path) {
   return ss.str();
 }
 
-void AddSignedDelta(std::unordered_map<uint64_t, int64_t>* m, uint64_t key, int64_t delta) {
-  auto it = m->find(key);
-  if (it == m->end()) {
-    (*m)[key] = delta;
+void AddSignedDelta(U64SignedMap* m, uint64_t key, int64_t delta) {
+  auto [it, inserted] = m->try_emplace(key, delta);
+  if (inserted) {
     return;
   }
   it->second += delta;
@@ -481,10 +575,9 @@ void AddSignedDelta(std::unordered_map<uint64_t, int64_t>* m, uint64_t key, int6
   }
 }
 
-void AddUnsignedDelta(std::unordered_map<uint64_t, uint64_t>* m, uint64_t key, uint64_t delta) {
-  auto it = m->find(key);
-  if (it == m->end()) {
-    (*m)[key] = delta;
+void AddUnsignedDelta(U64Map* m, uint64_t key, uint64_t delta) {
+  auto [it, inserted] = m->try_emplace(key, delta);
+  if (inserted) {
     return;
   }
   it->second += delta;
@@ -595,8 +688,8 @@ class StepAccumulator {
   uint64_t win_fs_;
   uint64_t step_fs_;
 
-  std::unordered_map<uint64_t, int64_t> window_delta_;
-  std::unordered_map<uint64_t, uint64_t> cumulative_start_delta_;
+  U64SignedMap window_delta_;
+  U64Map cumulative_start_delta_;
 
   uint64_t max_step_ = 0;
   uint64_t total_toggles_ = 0;
@@ -608,21 +701,13 @@ class VcdParser {
       : opts_(opts), accumulator_(opts.win_fs, opts.step_fs) {}
 
   void Parse(FILE* file, const std::string& input_name) {
-    constexpr size_t kLineBufSize = 1 << 20;
-    std::vector<char> line_buf(kLineBufSize);
+    std::vector<char> line_buf(kInputBufferSize);
 
     bool in_timescale = false;
     std::string timescale_accum;
 
     while (std::fgets(line_buf.data(), static_cast<int>(line_buf.size()), file) != nullptr) {
       ++stats_.total_lines;
-
-      if (std::strchr(line_buf.data(), '\n') == nullptr) {
-        int ch = 0;
-        do {
-          ch = std::fgetc(file);
-        } while (ch != '\n' && ch != EOF);
-      }
 
       std::string_view line = Trim(line_buf.data());
       if (line.empty()) {
@@ -758,9 +843,15 @@ class VcdParser {
     if (id_tok.empty()) {
       return;
     }
-
-    const std::string id(id_tok);
-    known_ids_.insert(id);
+    std::string_view id_key = id_tok;
+    auto known_it = known_ids_.find(id_tok);
+    if (known_it == known_ids_.end()) {
+      id_storage_.emplace_back(id_tok);
+      id_key = id_storage_.back();
+      known_ids_.insert(id_key);
+    } else {
+      id_key = *known_it;
+    }
 
     std::string_view leaf_tok;
     for (;;) {
@@ -782,7 +873,7 @@ class VcdParser {
       width = 1;
     }
 
-    auto existing_it = id_to_index_.find(id);
+    auto existing_it = id_to_index_.find(id_key);
     if (existing_it != id_to_index_.end()) {
       ++stats_.alias_dedup_skipped;
       SignalState& existing = signals_[existing_it->second];
@@ -799,16 +890,15 @@ class VcdParser {
     }
 
     SignalState signal;
-    signal.fqsn = fqsn;
     signal.output_name = *filtered_name;
     signal.leaf_name = std::string(leaf_tok);
     signal.depth = HierarchyDepth(signal.output_name);
     signal.width = static_cast<uint32_t>(std::min<uint64_t>(width, std::numeric_limits<uint32_t>::max()));
-    signal.value.reserve(signal.width <= 256 ? signal.width : 256);
+    signal.value.clear();
 
     const size_t idx = signals_.size();
     signals_.push_back(std::move(signal));
-    id_to_index_[id] = idx;
+    id_to_index_.emplace(id_key, idx);
   }
 
   void ParseDataLine(std::string_view line) {
@@ -855,36 +945,32 @@ class VcdParser {
   }
 
   uint64_t ApplyChange(std::string_view id_sv, std::string_view raw_value) {
-    const std::string id(id_sv);
-    auto it = id_to_index_.find(id);
+    auto it = id_to_index_.find(id_sv);
     if (it == id_to_index_.end()) {
-      if (known_ids_.find(id) == known_ids_.end()) {
+      if (known_ids_.find(id_sv) == known_ids_.end()) {
         ++stats_.unknown_id_changes;
       }
       return 0;
     }
 
     SignalState& signal = signals_[it->second];
-    std::string normalized = NormalizeValue(raw_value, signal.width);
+    const size_t width = std::max<uint32_t>(signal.width, 1U);
+    if (signal.value.size() != width) {
+      signal.value.assign(width, 'x');
+      if (signal.initialized) {
+        FillNormalizedValue(&signal.value, raw_value);
+        return 0;
+      }
+    }
 
     if (!signal.initialized) {
       signal.initialized = true;
-      signal.value = std::move(normalized);
+      FillNormalizedValue(&signal.value, raw_value);
       return 0;
     }
-
-    if (signal.value.size() != normalized.size()) {
-      signal.value = std::move(normalized);
-      return 0;
-    }
-
-    uint64_t toggles = 0;
-    for (size_t i = 0; i < signal.value.size(); ++i) {
-      toggles += (signal.value[i] != normalized[i]) ? 1ULL : 0ULL;
-    }
+    uint64_t toggles = CountTogglesAndUpdate(&signal.value, raw_value);
 
     if (toggles > 0) {
-      signal.value = std::move(normalized);
       signal.total_toggles += toggles;
     }
 
@@ -900,8 +986,9 @@ class VcdParser {
   uint64_t current_timestamp_ = 0;
 
   std::vector<std::string> scope_stack_;
-  std::unordered_map<std::string, size_t> id_to_index_;
-  std::unordered_set<std::string> known_ids_;
+  StringViewIndexMap id_to_index_;
+  StringViewSet known_ids_;
+  std::deque<std::string> id_storage_;
   std::vector<SignalState> signals_;
 };
 
@@ -1059,6 +1146,7 @@ bool OpenInput(const Options& opts, InputHandle* handle, std::string* error) {
   if (opts.input_path == "-") {
     handle->stream = stdin;
     handle->is_stdin = true;
+    std::setvbuf(handle->stream, nullptr, _IOFBF, kInputBufferSize);
     return true;
   }
 
@@ -1085,6 +1173,7 @@ bool OpenInput(const Options& opts, InputHandle* handle, std::string* error) {
         _exit(127);
       }
       close(fds[1]);
+      execlp("pigz", "pigz", "-dc", "--", opts.input_path.c_str(), static_cast<char*>(nullptr));
       execlp("gzip", "gzip", "-dc", "--", opts.input_path.c_str(), static_cast<char*>(nullptr));
       _exit(127);
     }
@@ -1102,6 +1191,7 @@ bool OpenInput(const Options& opts, InputHandle* handle, std::string* error) {
 
     handle->stream = stream;
     handle->gzip_pid = pid;
+    std::setvbuf(handle->stream, nullptr, _IOFBF, kInputBufferSize);
     return true;
   }
 
@@ -1111,6 +1201,7 @@ bool OpenInput(const Options& opts, InputHandle* handle, std::string* error) {
     return false;
   }
   handle->stream = input;
+  std::setvbuf(handle->stream, nullptr, _IOFBF, kInputBufferSize);
   return true;
 }
 
@@ -1171,7 +1262,6 @@ std::vector<TopWindow> SelectTopWindows(const std::vector<SeriesPoint>& points,
         .right_fs = p.right_fs,
         .effective_window_fs = p.effective_window_fs,
         .window_toggles = p.window_toggles,
-        .cumulative_toggles = p.cumulative_toggles,
         .rate = p.rate,
     });
   }

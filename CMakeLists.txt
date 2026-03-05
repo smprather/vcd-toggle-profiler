@@ -15,4 +15,12 @@ target_include_directories(vcd-toggle-profiler PRIVATE
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(vcd-toggle-profiler PRIVATE -Wall -Wextra)
+  target_compile_options(vcd-toggle-profiler PRIVATE
+    $<$<CONFIG:Release>:-march=native>
+    $<$<CONFIG:Release>:-mtune=native>
+    $<$<CONFIG:Release>:-flto>
+  )
+  target_link_options(vcd-toggle-profiler PRIVATE
+    $<$<CONFIG:Release>:-flto>
+  )
 endif()

@@ -26,31 +26,30 @@ windows — all in a single offline HTML file powered by
   counted once.
 - **Downsampling** — large traces are downsampled to `--max-points` for fast
   rendering while preserving peaks on the rate series.
-- **Fully offline** — all dependencies (uPlot JS/CSS, CLI11) are vendored.
-  No network access required to build or run.
+- **Fully offline** — no third-party Rust crates are required; uPlot assets are
+  vendored in-repo. No network access is required to build or run.
 - **Gzip support** — reads `.vcd.gz` files transparently (pipes through `gzip -d`).
 - **Stdin support** — pass `-` as the input to read from a pipe.
 
 ## Build
 
-Requirements: a C++17 compiler, CMake >= 3.16, and `gzip` on `$PATH` for `.gz`
-input.
+Requirements: Rust toolchain (`cargo`) and `gzip` on `$PATH` for `.gz`
+input (`pigz` is used when available).
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
+cargo build --release
 ```
 
-The binary is written to `./build/vcd-toggle-profiler`.
+The binary is written to `./target/release/vcd-toggle-profiler`.
 
 ## Quick start
 
 ```bash
 # Basic run — writes report to output/toggle_profile.html
-./build/vcd-toggle-profiler vcd-samples/random/random.vcd
+./target/release/vcd-toggle-profiler vcd-samples/random/random.vcd
 
 # Custom window, step, time range, and output directory
-./build/vcd-toggle-profiler vcd-samples/swerv/swerv1.vcd \
+./target/release/vcd-toggle-profiler vcd-samples/swerv/swerv1.vcd \
   --outdir swerv-out \
   --win-size 500ps \
   --step-size 50ps \
@@ -59,11 +58,28 @@ The binary is written to `./build/vcd-toggle-profiler`.
   --rate-unit ns
 
 # Gzipped input
-./build/vcd-toggle-profiler vcd-samples/Briey/dump1.vcd.gz
+./target/release/vcd-toggle-profiler vcd-samples/Briey/dump1.vcd.gz
 
 # Pipe from another tool
-zcat huge.vcd.gz | ./build/vcd-toggle-profiler - --title "Huge design"
+zcat huge.vcd.gz | ./target/release/vcd-toggle-profiler - --title "Huge design"
 ```
+
+## Benchmark Quick Check
+
+Use the helper scripts in repo root:
+
+```bash
+hyperfine --warmup 1 --max-runs 3 ./run_rust
+hyperfine --warmup 1 --max-runs 3 ./run_cpp
+```
+
+Current reference run (Briey sample, `--max-points 0 --win-size 10ns --step-size 1ns`):
+
+- `run_rust`: ~3.15s mean
+- `run_cpp`: ~2.98s mean
+
+Recent C++ speedups were focused on minimizing parser-loop allocations and reducing
+hash/tokenization overhead for better scaling to very large VCD files.
 
 ## CLI reference
 
@@ -145,7 +161,6 @@ All third-party code is checked into the repository so the project builds
 fully offline:
 
 - **[uPlot](https://github.com/leeoniya/uPlot)** v1.6.16 — `third_party/uplot/`
-- **[CLI11](https://github.com/CLIUtils/CLI11)** — `third_party/CLI11/`
 
 ## License
 

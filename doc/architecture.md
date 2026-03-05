@@ -84,6 +84,6 @@
 
 ## Tech Stack
 
-- C++
+- Rust
 - [uPlot](https://github.com/leeoniya/uPlot)
-- CLI11 for CLI implementation
+- clap for CLI implementation

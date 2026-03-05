@@ -8,31 +8,49 @@ VCD Toggle Profiler — profiles total toggle-count vs. time for signals in Valu
 
 ## Status
 
-Implemented and functional. Single-file C++ implementation in `src/main.cpp` (~1500 lines). Builds with CMake and runs against included sample VCD files.
+Implemented and functional. Rust implementation in `src/main.rs`. Builds with Cargo and runs against included sample VCD files.
+
+Recent performance work also tuned the C++ implementation (`src/main.cpp`) for large
+trace throughput:
+- In-place value normalization/update in hot loops (remove per-change allocations)
+- `string_view`-based ID lookups with stable storage (remove per-change ID string construction)
+- Faster ASCII token/whitespace checks in parser paths
+- Fast hashers for high-frequency maps
+- `pigz`-first decompression and larger stdio buffering
+- Release flags: `-march=native -mtune=native -flto`
+
+Benchmark command:
+
+```bash
+hyperfine --warmup 1 --max-runs 3 ./run_rust
+hyperfine --warmup 1 --max-runs 3 ./run_cpp
+```
+
+Reference result on `vcd-samples/Briey/dump1.vcd.gz` (`--max-points 0 --win-size 10ns --step-size 1ns`):
+- Rust: ~3.15s mean
+- C++: ~2.98s mean
 
 ## Build
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
-# Binary: ./build/vcd-toggle-profiler
+cargo build --release
+# Binary: ./target/release/vcd-toggle-profiler
 ```
 
 ## Tech Stack
 
-- **C++17** — single-file implementation (`src/main.cpp`)
-- **CMake** >= 3.16 — build system (`CMakeLists.txt`)
-- **CLI11** — command-line parsing (vendored in `third_party/CLI11/`)
+- **Rust** — implementation (`src/main.rs`)
+- **Cargo** — build system (`Cargo.toml`)
 - **uPlot** v1.6.16 — chart library inlined into HTML output (vendored in `third_party/uplot/`)
 - **gzip/pigz** — runtime dependency for `.vcd.gz` decompression (pigz preferred when available)
 
 ## Project Structure
 
-- `src/main.cpp` — entire application (parser, profiler, HTML generator)
+- `src/main.rs` — entire application (parser, profiler, HTML generator)
 - `doc/architecture.md` — design spec and feature requirements
-- `third_party/` — vendored CLI11 and uPlot (fully offline build)
+- `third_party/` — vendored uPlot assets (fully offline build)
 - `vcd-samples/` — test VCD files at various scales
-- `build/` — CMake build directory (gitignored)
+- `target/` — Cargo build directory (gitignored)
 - `output/` — default output directory (gitignored)
 
 ## Architecture & Design Constraints
