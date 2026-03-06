@@ -24,14 +24,20 @@ windows — all in a single offline HTML file powered by
   name starts with a given prefix (prefix is stripped in output).
 - **Alias deduplication** — VCD identifiers that map to the same signal are
   counted once.
+- **Sparse series** — internal data structures scale with the number of
+  value-change events, not the trace duration divided by step size. Arbitrarily
+  small `--step-size` values work without blowing up memory.
 - **Downsampling** — large traces are downsampled to `--max-points` for fast
-  rendering while preserving peaks on the rate series.
+  rendering while preserving peaks on the rate series. Consecutive points with
+  unchanged y-values are deduplicated before downsampling.
 - **Fully offline** — no third-party Rust crates are required; uPlot assets are
   vendored in-repo. No network access is required to build or run.
 - **Gzip support** — reads `.vcd.gz` files transparently (pipes through `gzip -d`).
 - **Stdin support** — pass `-` as the input to read from a pipe.
 
 ## Build
+
+### Rust (primary)
 
 Requirements: Rust toolchain (`cargo`) and `gzip` on `$PATH` for `.gz`
 input (`pigz` is used when available).
@@ -41,6 +47,19 @@ cargo build --release
 ```
 
 The binary is written to `./target/release/vcd-toggle-profiler`.
+
+### C++ (alternative)
+
+Requirements: a C++17 compiler, CMake >= 3.16, and `gzip` on `$PATH` for `.gz`
+input (`pigz` is used when available). Release builds enable `-march=native`,
+`-mtune=native`, and LTO for maximum throughput.
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+The binary is written to `./build/vcd-toggle-profiler`.
 
 ## Quick start
 
@@ -145,9 +164,9 @@ The `vcd-samples/` directory contains test data at various scales:
 2. **Streaming value-change scan** — reads the VCD body line by line, tracking
    the current simulation time. On each value change, compares the new value
    against the signal's previous value to count bit-level toggles.
-3. **Windowed aggregation** — maintains a circular buffer of per-step toggle
-   counts. At each step boundary, computes the toggle rate
-   (`window_toggles / effective_window_size`) and the running cumulative count.
+3. **Windowed aggregation** — records signed deltas into sparse maps keyed by
+   step index. Series points are only materialized at steps where a delta
+   exists, so memory scales with event count regardless of step size.
 4. **Top-window selection** — sorts all windows by total toggles; greedily
    selects the top 20 (optionally enforcing non-overlap).
 5. **Report generation** — emits a static HTML file with vendored uPlot JS/CSS
@@ -161,6 +180,7 @@ All third-party code is checked into the repository so the project builds
 fully offline:
 
 - **[uPlot](https://github.com/leeoniya/uPlot)** v1.6.16 — `third_party/uplot/`
+- **[CLI11](https://github.com/CLIUtils/CLI11)** — `third_party/CLI11/` (C++ build only)
 
 ## License
 

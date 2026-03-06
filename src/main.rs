@@ -507,7 +507,6 @@ struct StepAccumulator {
     step_fs: u64,
     window_delta: FastMap<u64, i64>,
     cumulative_start_delta: FastMap<u64, u64>,
-    max_step: u64,
     total_toggles: u64,
 }
 
@@ -518,7 +517,6 @@ impl StepAccumulator {
             step_fs,
             window_delta: FastMap::default(),
             cumulative_start_delta: FastMap::default(),
-            max_step: 0,
             total_toggles: 0,
         }
     }
@@ -539,15 +537,9 @@ impl StepAccumulator {
             if n_hi != u64::MAX {
                 add_signed_delta(&mut self.window_delta, n_hi + 1, -(toggles as i64));
             }
-            if n_hi > self.max_step {
-                self.max_step = n_hi;
-            }
         }
 
         add_unsigned_delta(&mut self.cumulative_start_delta, n_lo, toggles);
-        if n_lo > self.max_step {
-            self.max_step = n_lo;
-        }
 
         self.total_toggles = self.total_toggles.saturating_add(toggles);
     }
@@ -561,23 +553,30 @@ impl StepAccumulator {
             .map(|(k, v)| (*k, *v))
             .collect();
 
-        window_deltas.sort_by_key(|x| x.0);
-        cumulative_deltas.sort_by_key(|x| x.0);
+        window_deltas.sort_unstable_by_key(|x| x.0);
+        cumulative_deltas.sort_unstable_by_key(|x| x.0);
 
-        let mut out = Vec::new();
-        out.reserve((self.max_step as usize).saturating_add(1));
+        // Sparse iteration: only visit steps where a delta exists.
+        // Memory is O(number of value-change events), not O(trace_duration / step_size).
+        let mut steps: Vec<u64> =
+            Vec::with_capacity(window_deltas.len() + cumulative_deltas.len());
+        for &(k, _) in &window_deltas {
+            steps.push(k);
+        }
+        for &(k, _) in &cumulative_deltas {
+            steps.push(k);
+        }
+        steps.sort_unstable();
+        steps.dedup();
+
+        let mut out = Vec::with_capacity(steps.len());
 
         let mut wi = 0usize;
         let mut ci = 0usize;
         let mut running_window: i64 = 0;
         let mut running_cumulative: u64 = 0;
 
-        let mut step = 0u64;
-        loop {
-            if step > self.max_step {
-                break;
-            }
-
+        for &step in &steps {
             while wi < window_deltas.len() && window_deltas[wi].0 == step {
                 running_window += window_deltas[wi].1;
                 wi += 1;
@@ -616,11 +615,6 @@ impl StepAccumulator {
                 cumulative_toggles: running_cumulative,
                 rate,
             });
-
-            if step == u64::MAX {
-                break;
-            }
-            step += 1;
         }
 
         out
@@ -1145,6 +1139,50 @@ fn build_plot_data(points: &[SeriesPoint]) -> PlotData {
         out.y_rate.push(0.0);
         out.y_cumulative.push(0.0);
     }
+
+    out
+}
+
+/// Remove interior points in runs where both y-values are unchanged.
+/// Keeps the first and last point of each constant run so line segments
+/// render correctly in the chart.
+fn dedup_plot_data(input: &PlotData) -> PlotData {
+    let n = input.x_values.len();
+    if n <= 2 {
+        return input.clone();
+    }
+
+    let mut out = PlotData {
+        x_values: Vec::with_capacity(n),
+        y_rate: Vec::with_capacity(n),
+        y_cumulative: Vec::with_capacity(n),
+        x_unit_label: input.x_unit_label.clone(),
+        x_unit_fs: input.x_unit_fs,
+        cumulative_unit_label: input.cumulative_unit_label.clone(),
+        cumulative_unit_scale: input.cumulative_unit_scale,
+    };
+
+    // Always keep the first point.
+    out.x_values.push(input.x_values[0]);
+    out.y_rate.push(input.y_rate[0]);
+    out.y_cumulative.push(input.y_cumulative[0]);
+
+    for i in 1..n - 1 {
+        let same_as_prev = input.y_rate[i] == input.y_rate[i - 1]
+            && input.y_cumulative[i] == input.y_cumulative[i - 1];
+        let same_as_next = input.y_rate[i] == input.y_rate[i + 1]
+            && input.y_cumulative[i] == input.y_cumulative[i + 1];
+        if !(same_as_prev && same_as_next) {
+            out.x_values.push(input.x_values[i]);
+            out.y_rate.push(input.y_rate[i]);
+            out.y_cumulative.push(input.y_cumulative[i]);
+        }
+    }
+
+    // Always keep the last point.
+    out.x_values.push(input.x_values[n - 1]);
+    out.y_rate.push(input.y_rate[n - 1]);
+    out.y_cumulative.push(input.y_cumulative[n - 1]);
 
     out
 }
@@ -1930,7 +1968,8 @@ fn run(opts: Options) -> Result<(), String> {
     let top_series = filter_series_to_full_window_only(&series, opts.win_fs);
     let top_windows = select_top_windows(&top_series, opts.allow_top_window_overlap, 20);
     let plot_full = build_plot_data(&series);
-    let plot = downsample_plot_data(&plot_full, opts.max_points);
+    let plot_deduped = dedup_plot_data(&plot_full);
+    let plot = downsample_plot_data(&plot_deduped, opts.max_points);
 
     let outdir = PathBuf::from(&opts.outdir);
     let html_path = outdir.join("toggle_profile.html");
