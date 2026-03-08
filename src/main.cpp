@@ -42,11 +42,14 @@ struct Options {
   uint64_t step_fs = 50000;      // 50ps
   uint64_t rate_unit_fs = 1000000;  // 1ns
   std::string rate_unit_label = "ns";
+  uint64_t table_time_unit_fs = 1000000;  // 1ns
+  std::string table_time_unit_label = "ns";
   bool has_start_time = false;
   bool has_stop_time = false;
   uint64_t start_fs = 0;
   uint64_t snapped_start_fs = 0;
   uint64_t stop_fs = 0;
+  uint64_t glitch_threshold_fs = 0;
 
   bool allow_top_window_overlap = false;
   bool debug = false;
@@ -64,6 +67,14 @@ struct SignalState {
   uint32_t width = 1;
   bool initialized = false;
   std::string value;
+  bool has_pending_change = false;
+  uint64_t pending_change_fs = 0;
+  uint64_t pending_toggles = 0;
+  std::string pending_value;
+  std::string scratch_value;
+  bool has_last_change_time = false;
+  uint64_t last_change_time_fs = 0;
+  uint64_t glitches_filtered = 0;
 
   uint64_t total_toggles = 0;
 };
@@ -76,6 +87,9 @@ struct ParserStats {
   uint64_t alias_dedup_skipped = 0;
   bool found_timescale = false;
   uint64_t timescale_fs = 1000;
+  bool has_smallest_pulse_width = false;
+  uint64_t smallest_pulse_width_fs = 0;
+  uint64_t total_glitches_filtered = 0;
 };
 
 struct SeriesPoint {
@@ -271,6 +285,15 @@ uint64_t CountTogglesAndUpdate(std::string* dst, std::string_view raw) {
       cur[idx] = next;
       ++toggles;
     }
+  }
+  return toggles;
+}
+
+uint64_t CountTogglesBetween(const std::string& a, const std::string& b) {
+  const size_t width = std::min(a.size(), b.size());
+  uint64_t toggles = 0;
+  for (size_t i = 0; i < width; ++i) {
+    toggles += (a[i] != b[i]) ? 1ULL : 0ULL;
   }
   return toggles;
 }
@@ -564,6 +587,22 @@ std::string ReadTextFile(const fs::path& path) {
   return ss.str();
 }
 
+std::string FormatTrimmed(double value, int precision = 6) {
+  std::ostringstream ss;
+  ss << std::fixed << std::setprecision(precision) << value;
+  std::string s = ss.str();
+  while (!s.empty() && s.back() == '0') {
+    s.pop_back();
+  }
+  if (!s.empty() && s.back() == '.') {
+    s.pop_back();
+  }
+  if (s.empty()) {
+    s = "0";
+  }
+  return s;
+}
+
 void AddSignedDelta(U64SignedMap* m, uint64_t key, int64_t delta) {
   auto [it, inserted] = m->try_emplace(key, delta);
   if (inserted) {
@@ -762,6 +801,8 @@ class VcdParser {
 
       ParseDataLine(line);
     }
+
+    FlushPendingTransitions();
   }
 
   const ParserStats& stats() const { return stats_; }
@@ -769,6 +810,26 @@ class VcdParser {
   const std::vector<SignalState>& signals() const { return signals_; }
 
  private:
+  struct ApplyChangeResult {
+    bool parsed_toggle = false;
+    bool emit_event = false;
+    uint64_t event_time_fs = 0;
+    uint64_t toggles = 0;
+  };
+
+  void RecordObservedTransition(SignalState& signal, uint64_t timestamp_fs) {
+    if (signal.has_last_change_time) {
+      const uint64_t pulse_width_fs =
+          (timestamp_fs >= signal.last_change_time_fs) ? (timestamp_fs - signal.last_change_time_fs) : 0ULL;
+      if (!stats_.has_smallest_pulse_width || pulse_width_fs < stats_.smallest_pulse_width_fs) {
+        stats_.has_smallest_pulse_width = true;
+        stats_.smallest_pulse_width_fs = pulse_width_fs;
+      }
+    }
+    signal.has_last_change_time = true;
+    signal.last_change_time_fs = timestamp_fs;
+  }
+
   void ParseScope(std::string_view line) {
     const char* p = line.data();
     (void)ReadToken(p);  // $scope
@@ -917,14 +978,15 @@ class VcdParser {
       return;
     }
 
-    uint64_t toggles_sum = 0;
+    const uint64_t timestamp_fs = SaturatingU64(static_cast<unsigned __int128>(current_timestamp_) * timescale_fs_);
+    ApplyChangeResult result;
 
     if (lead == 'b' || lead == 'B' || lead == 'r' || lead == 'R') {
       const char* p = line.data() + 1;
       const std::string_view value = ReadToken(p);
       const std::string_view id = ReadToken(p);
       if (!value.empty() && !id.empty()) {
-        toggles_sum = ApplyChange(id, value);
+        result = ApplyChange(id, value, timestamp_fs);
       }
     } else if (lead == '0' || lead == '1' || lead == 'x' || lead == 'X' || lead == 'z' || lead == 'Z' ||
                lead == 'u' || lead == 'U' || lead == 'w' || lead == 'W' || lead == 'h' || lead == 'H' ||
@@ -933,48 +995,134 @@ class VcdParser {
       if (!id.empty()) {
         const char c = NormalizeLogicChar(lead);
         const char buf[2] = {c, '\0'};
-        toggles_sum = ApplyChange(id, std::string_view(buf, 1));
+        result = ApplyChange(id, std::string_view(buf, 1), timestamp_fs);
       }
     }
 
-    if (toggles_sum > 0) {
+    if (result.parsed_toggle) {
       ++stats_.parsed_value_changes;
-      const uint64_t timestamp_fs = SaturatingU64(static_cast<unsigned __int128>(current_timestamp_) * timescale_fs_);
-      accumulator_.AddEvent(timestamp_fs, toggles_sum);
+    }
+
+    if (result.emit_event && result.toggles > 0) {
+      accumulator_.AddEvent(result.event_time_fs, result.toggles);
     }
   }
 
-  uint64_t ApplyChange(std::string_view id_sv, std::string_view raw_value) {
+  ApplyChangeResult ApplyChange(std::string_view id_sv, std::string_view raw_value, uint64_t timestamp_fs) {
+    ApplyChangeResult result;
+
     auto it = id_to_index_.find(id_sv);
     if (it == id_to_index_.end()) {
       if (known_ids_.find(id_sv) == known_ids_.end()) {
         ++stats_.unknown_id_changes;
       }
-      return 0;
+      return result;
     }
 
     SignalState& signal = signals_[it->second];
     const size_t width = std::max<uint32_t>(signal.width, 1U);
     if (signal.value.size() != width) {
       signal.value.assign(width, 'x');
+      signal.pending_value.assign(width, 'x');
+      signal.scratch_value.assign(width, 'x');
+      signal.has_pending_change = false;
+      signal.pending_toggles = 0;
       if (signal.initialized) {
         FillNormalizedValue(&signal.value, raw_value);
-        return 0;
+        return result;
       }
     }
 
     if (!signal.initialized) {
       signal.initialized = true;
       FillNormalizedValue(&signal.value, raw_value);
-      return 0;
-    }
-    uint64_t toggles = CountTogglesAndUpdate(&signal.value, raw_value);
-
-    if (toggles > 0) {
-      signal.total_toggles += toggles;
+      signal.has_pending_change = false;
+      signal.pending_toggles = 0;
+      return result;
     }
 
-    return toggles;
+    if (opts_.glitch_threshold_fs == 0) {
+      uint64_t toggles = CountTogglesAndUpdate(&signal.value, raw_value);
+      if (toggles > 0) {
+        RecordObservedTransition(signal, timestamp_fs);
+        result.parsed_toggle = true;
+        result.emit_event = true;
+        result.event_time_fs = timestamp_fs;
+        result.toggles = toggles;
+        signal.total_toggles += toggles;
+      }
+      return result;
+    }
+
+    if (signal.pending_value.size() != width) {
+      signal.pending_value.assign(width, 'x');
+    }
+    if (signal.scratch_value.size() != width) {
+      signal.scratch_value.assign(width, 'x');
+    }
+
+    FillNormalizedValue(&signal.scratch_value, raw_value);
+
+    const std::string& previous_observed = signal.has_pending_change ? signal.pending_value : signal.value;
+    if (previous_observed == signal.scratch_value) {
+      return result;
+    }
+    RecordObservedTransition(signal, timestamp_fs);
+    result.parsed_toggle = true;
+
+    if (!signal.has_pending_change) {
+      signal.pending_toggles = CountTogglesBetween(signal.value, signal.scratch_value);
+      signal.pending_value = signal.scratch_value;
+      signal.pending_change_fs = timestamp_fs;
+      signal.has_pending_change = true;
+      return result;
+    }
+
+    const uint64_t delta_t = (timestamp_fs >= signal.pending_change_fs)
+                                 ? (timestamp_fs - signal.pending_change_fs)
+                                 : 0ULL;
+    if (delta_t < opts_.glitch_threshold_fs) {
+      ++signal.glitches_filtered;
+      ++stats_.total_glitches_filtered;
+      signal.has_pending_change = false;
+      signal.pending_toggles = 0;
+      return result;
+    }
+
+    if (signal.pending_toggles > 0) {
+      result.emit_event = true;
+      result.event_time_fs = signal.pending_change_fs;
+      result.toggles = signal.pending_toggles;
+      signal.total_toggles += signal.pending_toggles;
+    }
+
+    signal.value = signal.pending_value;
+    signal.pending_toggles = CountTogglesBetween(signal.value, signal.scratch_value);
+    signal.pending_value = signal.scratch_value;
+    signal.pending_change_fs = timestamp_fs;
+    signal.has_pending_change = true;
+    return result;
+  }
+
+  void FlushPendingTransitions() {
+    if (opts_.glitch_threshold_fs == 0) {
+      return;
+    }
+
+    for (SignalState& signal : signals_) {
+      if (!signal.has_pending_change) {
+        continue;
+      }
+
+      if (signal.pending_toggles > 0) {
+        accumulator_.AddEvent(signal.pending_change_fs, signal.pending_toggles);
+        signal.total_toggles += signal.pending_toggles;
+      }
+
+      signal.value = signal.pending_value;
+      signal.has_pending_change = false;
+      signal.pending_toggles = 0;
+    }
   }
 
   const Options& opts_;
@@ -1013,6 +1161,8 @@ int ParseOptions(int argc, char** argv, Options* opts) {
 
   std::string win_size_text = "500ps";
   std::string step_size_text = "50ps";
+  std::string time_unit_text = opts->table_time_unit_label;
+  std::string glitch_threshold_text = "0fs";
   std::string rate_unit_text = opts->rate_unit_label;
   std::string overlap_text = opts->allow_top_window_overlap ? "true" : "false";
   std::string start_time_text;
@@ -1025,6 +1175,12 @@ int ParseOptions(int argc, char** argv, Options* opts) {
       ->default_val(win_size_text);
   app.add_option("--step-size", step_size_text, "Step size (e.g. 50ps)")
       ->default_val(step_size_text);
+  app.add_option("--time-unit", time_unit_text, "Time unit for ASCII output and HTML tables: fs/ps/ns/us/ms/s")
+      ->default_val(time_unit_text);
+  app.add_option("--glitch-threshold",
+                 glitch_threshold_text,
+                 "Ignore back-to-back transitions on the same signal when the interval is less than this threshold (0 disables filtering)")
+      ->default_val(glitch_threshold_text);
   app.add_option("--start-time",
                  start_time_text,
                  "Start time for plotted/selected windows (snapped down to a step boundary)");
@@ -1068,6 +1224,10 @@ int ParseOptions(int argc, char** argv, Options* opts) {
     std::cerr << "error: --step-size " << err << "\n";
     return 1;
   }
+  if (!ParseNonNegativeDurationToFs(glitch_threshold_text, &opts->glitch_threshold_fs, &err)) {
+    std::cerr << "error: --glitch-threshold " << err << "\n";
+    return 1;
+  }
 
   uint64_t unit_fs = 0;
   if (!ParseUnitFs(rate_unit_text, &unit_fs)) {
@@ -1076,6 +1236,14 @@ int ParseOptions(int argc, char** argv, Options* opts) {
   }
   opts->rate_unit_fs = unit_fs;
   opts->rate_unit_label = ToLowerCopy(rate_unit_text);
+
+  uint64_t table_time_unit_fs = 0;
+  if (!ParseUnitFs(time_unit_text, &table_time_unit_fs)) {
+    std::cerr << "error: --time-unit must be one of fs/ps/ns/us/ms/s\n";
+    return 1;
+  }
+  opts->table_time_unit_fs = table_time_unit_fs;
+  opts->table_time_unit_label = ToLowerCopy(time_unit_text);
 
   bool overlap = false;
   if (!ParseBool(overlap_text, &overlap)) {
@@ -1545,50 +1713,63 @@ void WriteSignalCsv(const fs::path& path, const std::vector<SignalState>& signal
   }
 }
 
-void WriteTopWindows(const fs::path& path,
-                     const std::vector<TopWindow>& windows) {
-  auto fmt_trimmed = [](double value) -> std::string {
-    std::ostringstream ss;
-    ss << std::fixed << std::setprecision(6) << value;
-    std::string s = ss.str();
-    while (!s.empty() && s.back() == '0') {
-      s.pop_back();
+void WriteSignalGlitchCsv(const fs::path& path, const std::vector<SignalState>& signals) {
+  std::vector<const SignalState*> sorted;
+  sorted.reserve(signals.size());
+  for (const SignalState& s : signals) {
+    if (s.glitches_filtered > 0) {
+      sorted.push_back(&s);
     }
-    if (!s.empty() && s.back() == '.') {
-      s.pop_back();
-    }
-    if (s.empty()) {
-      s = "0";
-    }
-    return s;
-  };
+  }
 
+  std::sort(sorted.begin(), sorted.end(), [](const SignalState* a, const SignalState* b) {
+    if (a->glitches_filtered != b->glitches_filtered) {
+      return a->glitches_filtered > b->glitches_filtered;
+    }
+    return a->output_name < b->output_name;
+  });
+
+  std::ofstream out(path, std::ios::out | std::ios::trunc);
+  if (!out) {
+    throw std::runtime_error("failed to write glitch CSV: " + path.string());
+  }
+
+  out << "signal_name,glitch_count\n";
+  for (const SignalState* s : sorted) {
+    out << '"' << s->output_name << '"' << ',' << s->glitches_filtered << '\n';
+  }
+}
+
+void WriteTopWindows(const fs::path& path,
+                     const std::vector<TopWindow>& windows,
+                     uint64_t time_unit_fs,
+                     const std::string& time_unit_label) {
   std::ofstream out(path, std::ios::out | std::ios::trunc);
   if (!out) {
     throw std::runtime_error("failed to write top window file: " + path.string());
   }
 
   out << std::left << std::setw(6) << "rank" << ' '
-      << std::setw(16) << "left_ps" << ' '
-      << std::setw(16) << "right_ps" << ' '
+      << std::setw(16) << ("left_" + time_unit_label) << ' '
+      << std::setw(16) << ("right_" + time_unit_label) << ' '
       << std::setw(16) << "total_toggles" << ' '
       << "toggle_rate_per_ns"
       << '\n';
 
   for (size_t i = 0; i < windows.size(); ++i) {
     const TopWindow& w = windows[i];
-    const double left_ps = static_cast<double>(w.left_fs) / 1000.0;
-    const double right_ps = static_cast<double>(w.right_fs) / 1000.0;
+    const double left_time = static_cast<double>(w.left_fs) / static_cast<double>(time_unit_fs);
+    const double right_time = static_cast<double>(w.right_fs) / static_cast<double>(time_unit_fs);
     const double rate_per_ns = (w.effective_window_fs > 0)
                                    ? (static_cast<double>(w.window_toggles) * 1000000.0 /
                                       static_cast<double>(w.effective_window_fs))
                                    : 0.0;
 
     out << std::left << std::setw(6) << (i + 1) << ' '
-        << std::setw(16) << fmt_trimmed(left_ps) << ' '
-        << std::setw(16) << fmt_trimmed(right_ps) << ' '
+        << std::setw(16) << FormatTrimmed(left_time) << ' '
+        << std::setw(16) << FormatTrimmed(right_time) << ' '
         << std::setw(16) << w.window_toggles << ' '
-        << fmt_trimmed(rate_per_ns) << '\n';
+        << FormatTrimmed(rate_per_ns) << '\n';
   }
 }
 
@@ -1638,25 +1819,46 @@ void WriteHtmlReport(const fs::path& out_path,
       << "    <h2>Run Information</h2>\n"
       << "    <table>\n"
       << "      <tbody>\n"
-      << "        <tr><th>Window size</th><td>" << std::fixed << std::setprecision(3)
-      << (static_cast<double>(opts.win_fs) / 1000.0) << " ps</td></tr>\n"
-      << "        <tr><th>Step size</th><td>" << std::fixed << std::setprecision(3)
-      << (static_cast<double>(opts.step_fs) / 1000.0) << " ps</td></tr>\n";
+      << "        <tr><th>Window size</th><td>"
+      << FormatTrimmed(static_cast<double>(opts.win_fs) / static_cast<double>(opts.table_time_unit_fs))
+      << " "
+      << HtmlEscape(opts.table_time_unit_label) << "</td></tr>\n"
+      << "        <tr><th>Step size</th><td>"
+      << FormatTrimmed(static_cast<double>(opts.step_fs) / static_cast<double>(opts.table_time_unit_fs))
+      << " "
+      << HtmlEscape(opts.table_time_unit_label) << "</td></tr>\n"
+      << "        <tr><th>Glitch threshold</th><td>"
+      << FormatTrimmed(static_cast<double>(opts.glitch_threshold_fs) /
+                       static_cast<double>(opts.table_time_unit_fs))
+      << " "
+      << HtmlEscape(opts.table_time_unit_label) << "</td></tr>\n";
 
   if (opts.has_start_time) {
-    out << "        <tr><th>Start time requested</th><td>" << opts.start_fs << " fs</td></tr>\n"
-        << "        <tr><th>Start time snapped</th><td>" << opts.snapped_start_fs << " fs</td></tr>\n";
+    out << "        <tr><th>Start time requested</th><td>"
+        << FormatTrimmed(static_cast<double>(opts.start_fs) / static_cast<double>(opts.table_time_unit_fs))
+        << " "
+        << HtmlEscape(opts.table_time_unit_label) << "</td></tr>\n"
+        << "        <tr><th>Start time snapped</th><td>"
+        << FormatTrimmed(static_cast<double>(opts.snapped_start_fs) /
+                         static_cast<double>(opts.table_time_unit_fs))
+        << " "
+        << HtmlEscape(opts.table_time_unit_label) << "</td></tr>\n";
   }
   if (opts.has_stop_time) {
-    out << "        <tr><th>Stop time</th><td>" << opts.stop_fs << " fs</td></tr>\n";
+    out << "        <tr><th>Stop time</th><td>"
+        << FormatTrimmed(static_cast<double>(opts.stop_fs) / static_cast<double>(opts.table_time_unit_fs))
+        << " "
+        << HtmlEscape(opts.table_time_unit_label) << "</td></tr>\n";
   }
 
   out << "        <tr><th>X-axis unit</th><td>" << HtmlEscape(plot.x_unit_label) << "</td></tr>\n"
+      << "        <tr><th>Table/ASCII time unit</th><td>" << HtmlEscape(opts.table_time_unit_label) << "</td></tr>\n"
       << "        <tr><th>Cumulative y-axis unit</th><td>" << HtmlEscape(plot.cumulative_unit_label) << "</td></tr>\n"
       << "        <tr><th>Rate unit</th><td>" << HtmlEscape(opts.rate_unit_label) << "</td></tr>\n"
       << "        <tr><th>Signals retained</th><td>" << signal_count << "</td></tr>\n"
       << "        <tr><th>Alias vars skipped</th><td>" << stats.alias_dedup_skipped << "</td></tr>\n"
       << "        <tr><th>Total toggles</th><td>" << total_toggles << "</td></tr>\n"
+      << "        <tr><th>Total glitches filtered</th><td>" << stats.total_glitches_filtered << "</td></tr>\n"
       << "        <tr><th>Rendered points</th><td>" << plot.x_values.size() << "</td></tr>\n"
       << "        <tr><th>Input lines</th><td>" << stats.total_lines << "</td></tr>\n"
       << "        <tr><th>Timestamp lines</th><td>" << stats.timestamp_updates << "</td></tr>\n"
@@ -1672,8 +1874,8 @@ void WriteHtmlReport(const fs::path& out_path,
       << "      <thead>\n"
       << "        <tr>\n"
       << "          <th>Rank</th>\n"
-      << "          <th>Left (" << HtmlEscape(plot.x_unit_label) << ")</th>\n"
-      << "          <th>Right (" << HtmlEscape(plot.x_unit_label) << ")</th>\n"
+      << "          <th>Left (" << HtmlEscape(opts.table_time_unit_label) << ")</th>\n"
+      << "          <th>Right (" << HtmlEscape(opts.table_time_unit_label) << ")</th>\n"
       << "          <th>Total Toggles</th>\n"
       << "          <th>Rate (toggles/" << HtmlEscape(opts.rate_unit_label) << ")</th>\n"
       << "        </tr>\n"
@@ -1682,8 +1884,8 @@ void WriteHtmlReport(const fs::path& out_path,
 
   for (size_t i = 0; i < top_windows.size(); ++i) {
     const TopWindow& w = top_windows[i];
-    const double left = static_cast<double>(w.left_fs) / static_cast<double>(plot.x_unit_fs);
-    const double right = static_cast<double>(w.right_fs) / static_cast<double>(plot.x_unit_fs);
+    const double left = static_cast<double>(w.left_fs) / static_cast<double>(opts.table_time_unit_fs);
+    const double right = static_cast<double>(w.right_fs) / static_cast<double>(opts.table_time_unit_fs);
 
     out << "        <tr>"
         << "<td>" << (i + 1) << "</td>"
@@ -1839,6 +2041,7 @@ int main(int argc, char** argv) {
     const fs::path html_path = outdir_path / "toggle_profile.html";
     const fs::path signal_list_path = outdir_path / "signals.txt";
     const fs::path signal_csv_path = outdir_path / "signal_toggle_counts.csv";
+    const fs::path glitch_csv_path = outdir_path / "signal_glitch_counts.csv";
     const fs::path top_windows_path = outdir_path / "top_20_windows.txt";
     const fs::path debug_csv_path = outdir_path / "debug.csv";
 
@@ -1846,7 +2049,11 @@ int main(int argc, char** argv) {
     ++output_files_written;
     WriteSignalCsv(signal_csv_path, parser.signals());
     ++output_files_written;
-    WriteTopWindows(top_windows_path, top_windows);
+    if (opts.glitch_threshold_fs > 0) {
+      WriteSignalGlitchCsv(glitch_csv_path, parser.signals());
+      ++output_files_written;
+    }
+    WriteTopWindows(top_windows_path, top_windows, opts.table_time_unit_fs, opts.table_time_unit_label);
     ++output_files_written;
     if (opts.debug) {
       WriteDebugCsv(debug_csv_path, plot, opts);
@@ -1879,6 +2086,18 @@ int main(int argc, char** argv) {
               << "Signals retained: " << parser.signals().size() << "\n"
               << "Alias vars skipped: " << parser.stats().alias_dedup_skipped << "\n"
               << "Total toggles: " << parser.accumulator().total_toggles() << "\n"
+              << "Total glitches filtered: " << parser.stats().total_glitches_filtered << "\n"
+              << "Glitch threshold: "
+              << FormatTrimmed(static_cast<double>(opts.glitch_threshold_fs) /
+                               static_cast<double>(opts.table_time_unit_fs))
+              << " " << opts.table_time_unit_label << "\n"
+              << "Smallest pulse width detected: "
+              << (parser.stats().has_smallest_pulse_width
+                      ? (FormatTrimmed(static_cast<double>(parser.stats().smallest_pulse_width_fs) /
+                                       static_cast<double>(opts.table_time_unit_fs)) +
+                         " " + opts.table_time_unit_label)
+                      : std::string("n/a"))
+              << "\n"
               << "Series points (full): " << series_all.size() << "\n"
               << "Series points (time-filtered): " << series.size() << "\n"
               << "Rendered points: " << plot.x_values.size() << "\n"
@@ -1886,16 +2105,28 @@ int main(int argc, char** argv) {
               << "Signals list: " << signal_list_path.string() << "\n"
               << "Signal CSV: " << signal_csv_path.string() << "\n"
               << "Top windows: " << top_windows_path.string() << "\n";
+    if (opts.glitch_threshold_fs > 0) {
+      std::cout << "Signal glitch CSV: " << glitch_csv_path.string() << "\n";
+    }
     if (opts.debug) {
       std::cout << "Debug CSV: " << debug_csv_path.string() << "\n";
     }
 
     if (opts.has_start_time) {
-      std::cout << "Start time requested: " << opts.start_fs << " fs\n"
-                << "Start time snapped: " << opts.snapped_start_fs << " fs\n";
+      std::cout << "Start time requested: "
+                << FormatTrimmed(static_cast<double>(opts.start_fs) /
+                                 static_cast<double>(opts.table_time_unit_fs))
+                << " " << opts.table_time_unit_label << "\n"
+                << "Start time snapped: "
+                << FormatTrimmed(static_cast<double>(opts.snapped_start_fs) /
+                                 static_cast<double>(opts.table_time_unit_fs))
+                << " " << opts.table_time_unit_label << "\n";
     }
     if (opts.has_stop_time) {
-      std::cout << "Stop time: " << opts.stop_fs << " fs\n";
+      std::cout << "Stop time: "
+                << FormatTrimmed(static_cast<double>(opts.stop_fs) /
+                                 static_cast<double>(opts.table_time_unit_fs))
+                << " " << opts.table_time_unit_label << "\n";
     }
 
     return 0;

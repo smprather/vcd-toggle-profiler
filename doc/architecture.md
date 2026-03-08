@@ -23,6 +23,8 @@
 - Add a CLI option for toggle rate unit, --rate-unit `[si_prefix]s`, default=ns.
   The primary y-axis unit should be toggles/<rate_unit>. Put the unit in parenthesis
   in the y-axis label.
+- Add a CLI option for ASCII output and HTML table time unit:
+  --time-unit `[si_prefix]s`, default=ns.
 - Add a secondary y-axis that shows the cumulative total toggle count plot.
 - CLI option for an output directory, --outdir. The default is "output".
 - Print the list of all signals to a file. Sort the file first by hierarchy depth,
@@ -40,7 +42,7 @@
   window_size The window_size must be evenly divisible by the step size.
 - Write the top 20 total-toggle windows to a file.
   - Columnized tabular with space-character separation (no tabs)
-  - Columns: rank, left_ps, right_ps, total_toggles, toggle_rate_per_ns
+  - Columns: rank, left_<time_unit>, right_<time_unit>, total_toggles, toggle_rate_per_ns
   - Remove any '.00000...' from the numbers.
 - Add an option --allow-top-window-overlap (true|false). Default=false. If false, none of the top 20
   windows printed to the top-20 file are allowed to have overlap.
@@ -56,6 +58,24 @@
   --stop-time `time_value[si_prefix]s`
 - Add a --debug option to create a csv file containing these columns: time, toggle_rate,
   cumulative_toggle_count. put the units in parentheticals after the column header text. example: time(ns),toggle_rate(toggles/ns),cumulative_toggle_count
+- Add a glitch filter option:
+  --glitch-threshold `time_value[si_prefix]s`
+  Default is 0 (disabled). When enabled, if a signal transition occurs less than
+  the threshold after the previous transition on that same signal, both transitions
+  are ignored.
+  The reference for "previous transition" must roll back to the last legal
+  non-filtered transition before the glitch pair.
+- Track glitches as pairs (1 glitch = 2 filtered transitions), and report
+  glitch counts (do not report filtered-transition counts).
+- When glitch filtering is enabled (`--glitch-threshold > 0`), write
+  `signal_glitch_counts.csv` with columns:
+  `signal_name,glitch_count`
+  Include only signals with glitch_count > 0.
+  Reverse sort by glitch_count.
+- Print total glitches filtered in:
+  - ASCII summary output
+  - HTML run-information table
+- Print smallest pulse width detected in the ASCII summary output.
 
 ## Implementation Notes
 
@@ -65,6 +85,11 @@
   timestep. Plot all time step values. Downsample as needed. Do not process for peak
   preservation since cumulative is always monotonic rising.
 - Prefer using pigz over gzip, when available.
+- If the tool creates an output directory but exits before writing any output files,
+  remove the directory (only if it was created by this run and is still empty).
+- Keep both C++ and Rust source implementations in the repository.
+  - `src/main.cpp`
+  - `src/main.rs`
 
 ## Priorities
 
@@ -84,6 +109,8 @@
 
 ## Tech Stack
 
+- C++17
 - Rust
 - [uPlot](https://github.com/leeoniya/uPlot)
-- clap for CLI implementation
+- CLI11 for C++ CLI implementation
+- clap for Rust CLI implementation

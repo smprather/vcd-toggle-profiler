@@ -18,6 +18,9 @@ struct Options {
 
     win_fs: u64,
     step_fs: u64,
+    table_time_unit_fs: u64,
+    table_time_unit_label: String,
+    glitch_threshold_fs: u64,
     rate_unit_fs: u64,
     rate_unit_label: String,
 
@@ -45,6 +48,9 @@ impl Default for Options {
             preamble: String::new(),
             win_fs: 500_000,
             step_fs: 50_000,
+            table_time_unit_fs: 1_000_000,
+            table_time_unit_label: "ns".to_string(),
+            glitch_threshold_fs: 0,
             rate_unit_fs: 1_000_000,
             rate_unit_label: "ns".to_string(),
             has_start_time: false,
@@ -96,6 +102,22 @@ struct CliArgs {
         help = "Step size"
     )]
     step_size: String,
+
+    #[arg(
+        long = "time-unit",
+        value_name = "unit",
+        default_value = "ns",
+        help = "Time unit for ASCII output and HTML tables: fs/ps/ns/us/ms/s"
+    )]
+    time_unit: String,
+
+    #[arg(
+        long = "glitch-threshold",
+        value_name = "dur",
+        default_value = "0fs",
+        help = "Ignore back-to-back transitions on the same signal when the interval is less than this threshold (0 disables filtering)"
+    )]
+    glitch_threshold: String,
 
     #[arg(
         long = "start-time",
@@ -180,6 +202,14 @@ struct SignalState {
     width: u32,
     initialized: bool,
     value: Vec<u8>,
+    has_pending_change: bool,
+    pending_change_fs: u64,
+    pending_toggles: u64,
+    pending_value: Vec<u8>,
+    scratch_value: Vec<u8>,
+    has_last_change_time: bool,
+    last_change_time_fs: u64,
+    glitches_filtered: u64,
 
     total_toggles: u64,
 }
@@ -193,6 +223,9 @@ struct ParserStats {
     alias_dedup_skipped: u64,
     found_timescale: bool,
     timescale_fs: u64,
+    has_smallest_pulse_width: bool,
+    smallest_pulse_width_fs: u64,
+    total_glitches_filtered: u64,
 }
 
 impl Default for ParserStats {
@@ -205,6 +238,9 @@ impl Default for ParserStats {
             alias_dedup_skipped: 0,
             found_timescale: false,
             timescale_fs: 1_000,
+            has_smallest_pulse_width: false,
+            smallest_pulse_width_fs: 0,
+            total_glitches_filtered: 0,
         }
     }
 }
@@ -397,6 +433,17 @@ fn count_toggles_and_update(dst: &mut [u8], raw: &[u8]) -> u64 {
         }
     }
 
+    toggles
+}
+
+fn count_toggles_between(a: &[u8], b: &[u8]) -> u64 {
+    let width = min(a.len(), b.len());
+    let mut toggles = 0u64;
+    for i in 0..width {
+        if a[i] != b[i] {
+            toggles += 1;
+        }
+    }
     toggles
 }
 
@@ -733,6 +780,14 @@ impl StepAccumulator {
     }
 }
 
+#[derive(Default)]
+struct ApplyChangeResult {
+    parsed_toggle: bool,
+    emit_event: bool,
+    event_time_fs: u64,
+    toggles: u64,
+}
+
 struct VcdParser {
     opts: Options,
     accumulator: StepAccumulator,
@@ -835,6 +890,8 @@ impl VcdParser {
             self.parse_data_line(line_trimmed);
         }
 
+        self.flush_pending_transitions();
+
         Ok(())
     }
 
@@ -930,12 +987,61 @@ impl VcdParser {
             width: min(width, u32::MAX as u64) as u32,
             initialized: false,
             value: Vec::new(),
+            has_pending_change: false,
+            pending_change_fs: 0,
+            pending_toggles: 0,
+            pending_value: Vec::new(),
+            scratch_value: Vec::new(),
+            has_last_change_time: false,
+            last_change_time_fs: 0,
+            glitches_filtered: 0,
             total_toggles: 0,
         };
 
         let idx = self.signals.len();
         self.signals.push(signal);
         self.id_to_index.insert(id, idx);
+    }
+
+    fn record_observed_transition(
+        stats: &mut ParserStats,
+        signal: &mut SignalState,
+        timestamp_fs: u64,
+    ) {
+        if signal.has_last_change_time {
+            let pulse_width_fs = if timestamp_fs >= signal.last_change_time_fs {
+                timestamp_fs - signal.last_change_time_fs
+            } else {
+                0
+            };
+            if !stats.has_smallest_pulse_width || pulse_width_fs < stats.smallest_pulse_width_fs
+            {
+                stats.has_smallest_pulse_width = true;
+                stats.smallest_pulse_width_fs = pulse_width_fs;
+            }
+        }
+        signal.has_last_change_time = true;
+        signal.last_change_time_fs = timestamp_fs;
+    }
+
+    fn flush_pending_transitions(&mut self) {
+        if self.opts.glitch_threshold_fs == 0 {
+            return;
+        }
+
+        for signal in &mut self.signals {
+            if !signal.has_pending_change {
+                continue;
+            }
+            if signal.pending_toggles > 0 {
+                self.accumulator
+                    .add_event(signal.pending_change_fs, signal.pending_toggles);
+                signal.total_toggles = signal.total_toggles.saturating_add(signal.pending_toggles);
+            }
+            signal.value = signal.pending_value.clone();
+            signal.has_pending_change = false;
+            signal.pending_toggles = 0;
+        }
     }
 
     fn parse_data_line(&mut self, line: &str) {
@@ -957,13 +1063,15 @@ impl VcdParser {
             return;
         }
 
-        let mut toggles_sum = 0u64;
+        let timestamp_fs =
+            saturating_u64((self.current_timestamp as u128) * (self.timescale_fs as u128));
+        let mut result = ApplyChangeResult::default();
 
         if matches!(lead, b'b' | b'B' | b'r' | b'R') {
             let rest = &line[1..];
             let mut it = rest.split_ascii_whitespace();
             if let (Some(value), Some(id)) = (it.next(), it.next()) {
-                toggles_sum = self.apply_change_bytes(id, value.as_bytes());
+                result = self.apply_change_bytes(id, value.as_bytes(), timestamp_fs);
             }
         } else if matches!(
             lead,
@@ -985,45 +1093,123 @@ impl VcdParser {
             let id = line[1..].trim();
             if !id.is_empty() {
                 let scalar = [normalize_logic_byte(lead)];
-                toggles_sum = self.apply_change_bytes(id, &scalar);
+                result = self.apply_change_bytes(id, &scalar, timestamp_fs);
             }
         }
 
-        if toggles_sum > 0 {
+        if result.parsed_toggle {
             self.stats.parsed_value_changes += 1;
-            let timestamp_fs =
-                saturating_u64((self.current_timestamp as u128) * (self.timescale_fs as u128));
-            self.accumulator.add_event(timestamp_fs, toggles_sum);
+        }
+        if result.emit_event && result.toggles > 0 {
+            self.accumulator.add_event(result.event_time_fs, result.toggles);
         }
     }
 
-    fn apply_change_bytes(&mut self, id: &str, raw_value: &[u8]) -> u64 {
+    fn apply_change_bytes(
+        &mut self,
+        id: &str,
+        raw_value: &[u8],
+        timestamp_fs: u64,
+    ) -> ApplyChangeResult {
+        let mut result = ApplyChangeResult::default();
+
         let Some(idx) = self.id_to_index.get(id).copied() else {
             if !self.known_ids.contains(id) {
                 self.stats.unknown_id_changes += 1;
             }
-            return 0;
+            return result;
         };
 
+        let stats = &mut self.stats;
         let signal = &mut self.signals[idx];
         let width = max(signal.width, 1) as usize;
         if signal.value.len() != width {
             signal.value.resize(width, b'x');
+            signal.pending_value.resize(width, b'x');
+            signal.scratch_value.resize(width, b'x');
+            signal.has_pending_change = false;
+            signal.pending_toggles = 0;
+            if signal.initialized {
+                fill_normalized_value(&mut signal.value, raw_value);
+                return result;
+            }
         }
 
         if !signal.initialized {
             fill_normalized_value(&mut signal.value, raw_value);
             signal.initialized = true;
-            return 0;
+            signal.has_pending_change = false;
+            signal.pending_toggles = 0;
+            return result;
         }
 
-        let toggles = count_toggles_and_update(&mut signal.value, raw_value);
-
-        if toggles > 0 {
-            signal.total_toggles = signal.total_toggles.saturating_add(toggles);
+        if self.opts.glitch_threshold_fs == 0 {
+            let toggles = count_toggles_and_update(&mut signal.value, raw_value);
+            if toggles > 0 {
+                Self::record_observed_transition(stats, signal, timestamp_fs);
+                result.parsed_toggle = true;
+                result.emit_event = true;
+                result.event_time_fs = timestamp_fs;
+                result.toggles = toggles;
+                signal.total_toggles = signal.total_toggles.saturating_add(toggles);
+            }
+            return result;
         }
 
-        toggles
+        if signal.pending_value.len() != width {
+            signal.pending_value.resize(width, b'x');
+        }
+        if signal.scratch_value.len() != width {
+            signal.scratch_value.resize(width, b'x');
+        }
+
+        fill_normalized_value(&mut signal.scratch_value, raw_value);
+        let previous_observed = if signal.has_pending_change {
+            &signal.pending_value
+        } else {
+            &signal.value
+        };
+        if previous_observed == &signal.scratch_value {
+            return result;
+        }
+        Self::record_observed_transition(stats, signal, timestamp_fs);
+        result.parsed_toggle = true;
+
+        if !signal.has_pending_change {
+            signal.pending_toggles = count_toggles_between(&signal.value, &signal.scratch_value);
+            signal.pending_value.clone_from(&signal.scratch_value);
+            signal.pending_change_fs = timestamp_fs;
+            signal.has_pending_change = true;
+            return result;
+        }
+
+        let delta_t = if timestamp_fs >= signal.pending_change_fs {
+            timestamp_fs - signal.pending_change_fs
+        } else {
+            0
+        };
+        if delta_t < self.opts.glitch_threshold_fs {
+            signal.glitches_filtered = signal.glitches_filtered.saturating_add(1);
+            stats.total_glitches_filtered = stats.total_glitches_filtered.saturating_add(1);
+            signal.has_pending_change = false;
+            signal.pending_toggles = 0;
+            return result;
+        }
+
+        if signal.pending_toggles > 0 {
+            result.emit_event = true;
+            result.event_time_fs = signal.pending_change_fs;
+            result.toggles = signal.pending_toggles;
+            signal.total_toggles = signal.total_toggles.saturating_add(signal.pending_toggles);
+        }
+
+        signal.value.clone_from(&signal.pending_value);
+        signal.pending_toggles = count_toggles_between(&signal.value, &signal.scratch_value);
+        signal.pending_value.clone_from(&signal.scratch_value);
+        signal.pending_change_fs = timestamp_fs;
+        signal.has_pending_change = true;
+
+        result
     }
 }
 
@@ -1255,50 +1441,6 @@ fn build_plot_data(points: &[SeriesPoint]) -> PlotData {
     out
 }
 
-/// Remove interior points in runs where both y-values are unchanged.
-/// Keeps the first and last point of each constant run so line segments
-/// render correctly in the chart.
-fn dedup_plot_data(input: &PlotData) -> PlotData {
-    let n = input.x_values.len();
-    if n <= 2 {
-        return input.clone();
-    }
-
-    let mut out = PlotData {
-        x_values: Vec::with_capacity(n),
-        y_rate: Vec::with_capacity(n),
-        y_cumulative: Vec::with_capacity(n),
-        x_unit_label: input.x_unit_label.clone(),
-        x_unit_fs: input.x_unit_fs,
-        cumulative_unit_label: input.cumulative_unit_label.clone(),
-        cumulative_unit_scale: input.cumulative_unit_scale,
-    };
-
-    // Always keep the first point.
-    out.x_values.push(input.x_values[0]);
-    out.y_rate.push(input.y_rate[0]);
-    out.y_cumulative.push(input.y_cumulative[0]);
-
-    for i in 1..n - 1 {
-        let same_as_prev = input.y_rate[i] == input.y_rate[i - 1]
-            && input.y_cumulative[i] == input.y_cumulative[i - 1];
-        let same_as_next = input.y_rate[i] == input.y_rate[i + 1]
-            && input.y_cumulative[i] == input.y_cumulative[i + 1];
-        if !(same_as_prev && same_as_next) {
-            out.x_values.push(input.x_values[i]);
-            out.y_rate.push(input.y_rate[i]);
-            out.y_cumulative.push(input.y_cumulative[i]);
-        }
-    }
-
-    // Always keep the last point.
-    out.x_values.push(input.x_values[n - 1]);
-    out.y_rate.push(input.y_rate[n - 1]);
-    out.y_cumulative.push(input.y_cumulative[n - 1]);
-
-    out
-}
-
 fn downsample_plot_data(input: &PlotData, max_points: u64) -> PlotData {
     if max_points == 0 || (input.x_values.len() as u64) <= max_points {
         return input.clone();
@@ -1381,6 +1523,28 @@ fn write_signal_csv(path: &Path, signals: &[SignalState]) -> Result<(), String> 
     Ok(())
 }
 
+fn write_signal_glitch_csv(path: &Path, signals: &[SignalState]) -> Result<(), String> {
+    let mut sorted: Vec<&SignalState> = signals.iter().filter(|s| s.glitches_filtered > 0).collect();
+    sorted.sort_by(|a, b| {
+        b.glitches_filtered
+            .cmp(&a.glitches_filtered)
+            .then_with(|| a.output_name.cmp(&b.output_name))
+    });
+
+    let mut out = File::create(path)
+        .map_err(|e| format!("failed to write glitch CSV '{}': {e}", path.display()))?;
+
+    writeln!(out, "signal_name,glitch_count")
+        .map_err(|e| format!("failed to write glitch CSV '{}': {e}", path.display()))?;
+
+    for s in sorted {
+        writeln!(out, "\"{}\",{}", s.output_name, s.glitches_filtered)
+            .map_err(|e| format!("failed to write glitch CSV '{}': {e}", path.display()))?;
+    }
+
+    Ok(())
+}
+
 fn fmt_trimmed(value: f64) -> String {
     let mut s = format!("{:.6}", value);
     while s.ends_with('0') {
@@ -1396,20 +1560,29 @@ fn fmt_trimmed(value: f64) -> String {
     }
 }
 
-fn write_top_windows(path: &Path, windows: &[TopWindow]) -> Result<(), String> {
+fn write_top_windows(
+    path: &Path,
+    windows: &[TopWindow],
+    time_unit_fs: u64,
+    time_unit_label: &str,
+) -> Result<(), String> {
     let mut out = File::create(path)
         .map_err(|e| format!("failed to write top window file '{}': {e}", path.display()))?;
 
     writeln!(
         out,
         "{:<6} {:<16} {:<16} {:<16} {}",
-        "rank", "left_ps", "right_ps", "total_toggles", "toggle_rate_per_ns"
+        "rank",
+        format!("left_{}", time_unit_label),
+        format!("right_{}", time_unit_label),
+        "total_toggles",
+        "toggle_rate_per_ns"
     )
     .map_err(|e| format!("failed to write top window file '{}': {e}", path.display()))?;
 
     for (i, w) in windows.iter().enumerate() {
-        let left_ps = (w.left_fs as f64) / 1000.0;
-        let right_ps = (w.right_fs as f64) / 1000.0;
+        let left_time = (w.left_fs as f64) / (time_unit_fs as f64);
+        let right_time = (w.right_fs as f64) / (time_unit_fs as f64);
         let rate_per_ns = if w.effective_window_fs > 0 {
             (w.window_toggles as f64) * 1_000_000.0 / (w.effective_window_fs as f64)
         } else {
@@ -1420,8 +1593,8 @@ fn write_top_windows(path: &Path, windows: &[TopWindow]) -> Result<(), String> {
             out,
             "{:<6} {:<16} {:<16} {:<16} {}",
             i + 1,
-            fmt_trimmed(left_ps),
-            fmt_trimmed(right_ps),
+            fmt_trimmed(left_time),
+            fmt_trimmed(right_time),
             w.window_toggles,
             fmt_trimmed(rate_per_ns)
         )
@@ -1470,7 +1643,7 @@ fn write_f64_array(
         write!(out, "{:.p$}", v, p = precision)
             .map_err(|e| format!("failed to write HTML: {e}"))?;
     }
-    writeln!(out, "];\n").map_err(|e| format!("failed to write HTML: {e}"))?;
+    writeln!(out, "];").map_err(|e| format!("failed to write HTML: {e}"))?;
     Ok(())
 }
 
@@ -1566,36 +1739,48 @@ fn write_html_report(
     writeln!(out, "      <tbody>").map_err(|e| format!("failed to write HTML: {e}"))?;
     writeln!(
         out,
-        "        <tr><th>Window size</th><td>{:.3} ps</td></tr>",
-        (opts.win_fs as f64) / 1000.0
+        "        <tr><th>Window size</th><td>{} {}</td></tr>",
+        fmt_trimmed((opts.win_fs as f64) / (opts.table_time_unit_fs as f64)),
+        html_escape(&opts.table_time_unit_label)
     )
     .map_err(|e| format!("failed to write HTML: {e}"))?;
     writeln!(
         out,
-        "        <tr><th>Step size</th><td>{:.3} ps</td></tr>",
-        (opts.step_fs as f64) / 1000.0
+        "        <tr><th>Step size</th><td>{} {}</td></tr>",
+        fmt_trimmed((opts.step_fs as f64) / (opts.table_time_unit_fs as f64)),
+        html_escape(&opts.table_time_unit_label)
+    )
+    .map_err(|e| format!("failed to write HTML: {e}"))?;
+    writeln!(
+        out,
+        "        <tr><th>Glitch threshold</th><td>{} {}</td></tr>",
+        fmt_trimmed((opts.glitch_threshold_fs as f64) / (opts.table_time_unit_fs as f64)),
+        html_escape(&opts.table_time_unit_label)
     )
     .map_err(|e| format!("failed to write HTML: {e}"))?;
 
     if opts.has_start_time {
         writeln!(
             out,
-            "        <tr><th>Start time requested</th><td>{} fs</td></tr>",
-            opts.start_fs
+            "        <tr><th>Start time requested</th><td>{} {}</td></tr>",
+            fmt_trimmed((opts.start_fs as f64) / (opts.table_time_unit_fs as f64)),
+            html_escape(&opts.table_time_unit_label)
         )
         .map_err(|e| format!("failed to write HTML: {e}"))?;
         writeln!(
             out,
-            "        <tr><th>Start time snapped</th><td>{} fs</td></tr>",
-            opts.snapped_start_fs
+            "        <tr><th>Start time snapped</th><td>{} {}</td></tr>",
+            fmt_trimmed((opts.snapped_start_fs as f64) / (opts.table_time_unit_fs as f64)),
+            html_escape(&opts.table_time_unit_label)
         )
         .map_err(|e| format!("failed to write HTML: {e}"))?;
     }
     if opts.has_stop_time {
         writeln!(
             out,
-            "        <tr><th>Stop time</th><td>{} fs</td></tr>",
-            opts.stop_fs
+            "        <tr><th>Stop time</th><td>{} {}</td></tr>",
+            fmt_trimmed((opts.stop_fs as f64) / (opts.table_time_unit_fs as f64)),
+            html_escape(&opts.table_time_unit_label)
         )
         .map_err(|e| format!("failed to write HTML: {e}"))?;
     }
@@ -1604,6 +1789,12 @@ fn write_html_report(
         out,
         "        <tr><th>X-axis unit</th><td>{}</td></tr>",
         html_escape(&plot.x_unit_label)
+    )
+    .map_err(|e| format!("failed to write HTML: {e}"))?;
+    writeln!(
+        out,
+        "        <tr><th>Table/ASCII time unit</th><td>{}</td></tr>",
+        html_escape(&opts.table_time_unit_label)
     )
     .map_err(|e| format!("failed to write HTML: {e}"))?;
     writeln!(
@@ -1634,6 +1825,12 @@ fn write_html_report(
         out,
         "        <tr><th>Total toggles</th><td>{}</td></tr>",
         total_toggles
+    )
+    .map_err(|e| format!("failed to write HTML: {e}"))?;
+    writeln!(
+        out,
+        "        <tr><th>Total glitches filtered</th><td>{}</td></tr>",
+        stats.total_glitches_filtered
     )
     .map_err(|e| format!("failed to write HTML: {e}"))?;
     writeln!(
@@ -1687,13 +1884,13 @@ fn write_html_report(
     writeln!(
         out,
         "          <th>Left ({})</th>",
-        html_escape(&plot.x_unit_label)
+        html_escape(&opts.table_time_unit_label)
     )
     .map_err(|e| format!("failed to write HTML: {e}"))?;
     writeln!(
         out,
         "          <th>Right ({})</th>",
-        html_escape(&plot.x_unit_label)
+        html_escape(&opts.table_time_unit_label)
     )
     .map_err(|e| format!("failed to write HTML: {e}"))?;
     writeln!(out, "          <th>Total Toggles</th>")
@@ -1709,8 +1906,8 @@ fn write_html_report(
     writeln!(out, "      <tbody>").map_err(|e| format!("failed to write HTML: {e}"))?;
 
     for (i, w) in top_windows.iter().enumerate() {
-        let left = (w.left_fs as f64) / (plot.x_unit_fs as f64);
-        let right = (w.right_fs as f64) / (plot.x_unit_fs as f64);
+        let left = (w.left_fs as f64) / (opts.table_time_unit_fs as f64);
+        let right = (w.right_fs as f64) / (opts.table_time_unit_fs as f64);
 
         writeln!(
             out,
@@ -1794,6 +1991,7 @@ fn write_html_report(
         .map_err(|e| format!("failed to write HTML: {e}"))?;
     writeln!(out, "      ]").map_err(|e| format!("failed to write HTML: {e}"))?;
     writeln!(out, "    }};").map_err(|e| format!("failed to write HTML: {e}"))?;
+    writeln!(out).map_err(|e| format!("failed to write HTML: {e}"))?;
 
     writeln!(
         out,
@@ -1900,10 +2098,15 @@ fn parse_options() -> Result<Options, String> {
         parse_duration_to_fs(&cli.win_size, false).map_err(|e| format!("--win-size {}", e))?;
     opts.step_fs =
         parse_duration_to_fs(&cli.step_size, false).map_err(|e| format!("--step-size {}", e))?;
+    opts.glitch_threshold_fs = parse_duration_to_fs(&cli.glitch_threshold, true)
+        .map_err(|e| format!("--glitch-threshold {}", e))?;
 
     opts.rate_unit_fs = parse_unit_fs(&cli.rate_unit)
         .ok_or_else(|| "--rate-unit must be one of fs/ps/ns/us/ms/s".to_string())?;
     opts.rate_unit_label = cli.rate_unit.to_ascii_lowercase();
+    opts.table_time_unit_fs = parse_unit_fs(&cli.time_unit)
+        .ok_or_else(|| "--time-unit must be one of fs/ps/ns/us/ms/s".to_string())?;
+    opts.table_time_unit_label = cli.time_unit.to_ascii_lowercase();
 
     opts.allow_top_window_overlap = parse_bool(&cli.allow_top_window_overlap)
         .ok_or_else(|| "--allow-top-window-overlap must be true or false".to_string())?;
@@ -2040,12 +2243,12 @@ fn run(opts: Options) -> Result<(), String> {
     let top_series = filter_series_to_full_window_only(&series, opts.win_fs);
     let top_windows = select_top_windows(&top_series, opts.allow_top_window_overlap, 20);
     let plot_full = build_plot_data(&series);
-    let plot_deduped = dedup_plot_data(&plot_full);
-    let plot = downsample_plot_data(&plot_deduped, opts.max_points);
+    let plot = downsample_plot_data(&plot_full, opts.max_points);
 
     let html_path = outdir.join("toggle_profile.html");
     let signal_list_path = outdir.join("signals.txt");
     let signal_csv_path = outdir.join("signal_toggle_counts.csv");
+    let glitch_csv_path = outdir.join("signal_glitch_counts.csv");
     let top_windows_path = outdir.join("top_20_windows.txt");
     let debug_csv_path = outdir.join("debug.csv");
 
@@ -2053,7 +2256,16 @@ fn run(opts: Options) -> Result<(), String> {
     outdir_guard.mark_file_written();
     write_signal_csv(&signal_csv_path, &parser.signals)?;
     outdir_guard.mark_file_written();
-    write_top_windows(&top_windows_path, &top_windows)?;
+    if opts.glitch_threshold_fs > 0 {
+        write_signal_glitch_csv(&glitch_csv_path, &parser.signals)?;
+        outdir_guard.mark_file_written();
+    }
+    write_top_windows(
+        &top_windows_path,
+        &top_windows,
+        opts.table_time_unit_fs,
+        &opts.table_time_unit_label,
+    )?;
     outdir_guard.mark_file_written();
     if opts.debug {
         write_debug_csv(&debug_csv_path, &plot, &opts)?;
@@ -2091,6 +2303,29 @@ fn run(opts: Options) -> Result<(), String> {
     println!("Signals retained: {}", parser.signals.len());
     println!("Alias vars skipped: {}", parser.stats.alias_dedup_skipped);
     println!("Total toggles: {}", parser.accumulator.total_toggles);
+    println!(
+        "Total glitches filtered: {}",
+        parser.stats.total_glitches_filtered
+    );
+    println!(
+        "Glitch threshold: {} {}",
+        fmt_trimmed((opts.glitch_threshold_fs as f64) / (opts.table_time_unit_fs as f64)),
+        opts.table_time_unit_label
+    );
+    println!(
+        "Smallest pulse width detected: {}",
+        if parser.stats.has_smallest_pulse_width {
+            format!(
+                "{} {}",
+                fmt_trimmed(
+                    (parser.stats.smallest_pulse_width_fs as f64) / (opts.table_time_unit_fs as f64)
+                ),
+                opts.table_time_unit_label
+            )
+        } else {
+            "n/a".to_string()
+        }
+    );
     println!("Series points (full): {}", series_all.len());
     println!("Series points (time-filtered): {}", series.len());
     println!("Rendered points: {}", plot.x_values.len());
@@ -2098,15 +2333,30 @@ fn run(opts: Options) -> Result<(), String> {
     println!("Signals list: {}", signal_list_path.display());
     println!("Signal CSV: {}", signal_csv_path.display());
     println!("Top windows: {}", top_windows_path.display());
+    if opts.glitch_threshold_fs > 0 {
+        println!("Signal glitch CSV: {}", glitch_csv_path.display());
+    }
     if opts.debug {
         println!("Debug CSV: {}", debug_csv_path.display());
     }
     if opts.has_start_time {
-        println!("Start time requested: {} fs", opts.start_fs);
-        println!("Start time snapped: {} fs", opts.snapped_start_fs);
+        println!(
+            "Start time requested: {} {}",
+            fmt_trimmed((opts.start_fs as f64) / (opts.table_time_unit_fs as f64)),
+            opts.table_time_unit_label
+        );
+        println!(
+            "Start time snapped: {} {}",
+            fmt_trimmed((opts.snapped_start_fs as f64) / (opts.table_time_unit_fs as f64)),
+            opts.table_time_unit_label
+        );
     }
     if opts.has_stop_time {
-        println!("Stop time: {} fs", opts.stop_fs);
+        println!(
+            "Stop time: {} {}",
+            fmt_trimmed((opts.stop_fs as f64) / (opts.table_time_unit_fs as f64)),
+            opts.table_time_unit_label
+        );
     }
 
     Ok(())

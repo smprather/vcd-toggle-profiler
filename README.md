@@ -112,6 +112,8 @@ USAGE:  vcd-toggle-profiler <input> [OPTIONS]
 | `--outdir <dir>` | Output directory | `output` |
 | `--win-size <dur>` | Sliding window size | `500ps` |
 | `--step-size <dur>` | Step size between successive windows | `50ps` |
+| `--time-unit <unit>` | Time unit used in ASCII output and HTML tables (`fs/ps/ns/us/ms/s`) | `ns` |
+| `--glitch-threshold <dur>` | Ignore back-to-back transitions on the same signal when the interval is less than this threshold (both transitions are dropped) | `0fs` |
 | `--start-time <dur>` | Start of the analysis range (snapped down to step boundary) | *beginning of trace* |
 | `--stop-time <dur>` | End of the analysis range | *end of trace* |
 | `--rate-unit <unit>` | Time unit for the rate denominator (y-axis) | `ns` |
@@ -141,7 +143,8 @@ All files are written under the `--outdir` directory:
 | `toggle_profile.html` | Self-contained interactive report (dual-axis chart, info table, top-20 windows table) |
 | `signals.txt` | All matched signals, sorted by hierarchy depth then leaf-name length then lexicographic |
 | `signal_toggle_counts.csv` | `signal_name,total_toggle_count` — reverse-sorted by count |
-| `top_20_windows.txt` | Space-aligned table: `rank left_ps right_ps total_toggles toggle_rate_per_ns` |
+| `signal_glitch_counts.csv` | *(only when `--glitch-threshold > 0`)* `signal_name,glitch_count` — reverse-sorted by glitch count, only signals with count > 0 |
+| `top_20_windows.txt` | Space-aligned table: `rank left_<time_unit> right_<time_unit> total_toggles toggle_rate_per_ns` |
 | `debug.csv` | *(only with `--debug`)* `time(<unit>),toggle_rate(toggles/<rate_unit>),cumulative_toggle_count` |
 
 ## Sample VCD files
