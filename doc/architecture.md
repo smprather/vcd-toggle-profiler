@@ -87,9 +87,8 @@
 - Prefer using pigz over gzip, when available.
 - If the tool creates an output directory but exits before writing any output files,
   remove the directory (only if it was created by this run and is still empty).
-- Keep both C++ and Rust source implementations in the repository.
+- Keep the C++ source implementation in the repository.
   - `src/main.cpp`
-  - `src/main.rs`
 
 ## Priorities
 
@@ -110,7 +109,5 @@
 ## Tech Stack
 
 - C++17
-- Rust
 - [uPlot](https://github.com/leeoniya/uPlot)
 - CLI11 for C++ CLI implementation
-- clap for Rust CLI implementation

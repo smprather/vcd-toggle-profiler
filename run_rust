@@ -1,2 +1,0 @@
-#!/bin/bash
-cargo run --release -- --max-points 0 vcd-samples/Briey/dump1.vcd.gz --win-size 10ns --step-size 1ns

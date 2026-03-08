@@ -8,7 +8,7 @@ VCD Toggle Profiler — profiles total toggle-count vs. time for signals in Valu
 
 ## Status
 
-Implemented and functional. Rust implementation in `src/main.rs`. Builds with Cargo and runs against included sample VCD files.
+Implemented and functional. C++ implementation in `src/main.cpp`. Builds with CMake and runs against included sample VCD files.
 
 Recent performance work also tuned the C++ implementation (`src/main.cpp`) for large
 trace throughput:
@@ -22,36 +22,35 @@ trace throughput:
 Benchmark command:
 
 ```bash
-hyperfine --warmup 1 --max-runs 3 ./run_rust
 hyperfine --warmup 1 --max-runs 3 ./run_cpp
 ```
 
 Reference result on `vcd-samples/Briey/dump1.vcd.gz` (`--max-points 0 --win-size 10ns --step-size 1ns`):
-- Rust: ~3.15s mean
 - C++: ~2.98s mean
 
 ## Build
 
 ```bash
-cargo build --release
-# Binary: ./target/release/vcd-toggle-profiler
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+# Binary: ./build/vcd-toggle-profiler
 ```
 
 ## Tech Stack
 
-- **Rust** — implementation (`src/main.rs`)
-- **Cargo** — build system (`Cargo.toml`)
-- **clap** — Rust CLI parser (vendored in `third_party/cargo-vendor/`)
+- **C++17** — implementation (`src/main.cpp`)
+- **CMake** — build system
+- **CLI11** — C++ CLI parser (vendored in `third_party/CLI11/`)
 - **uPlot** v1.6.16 — chart library inlined into HTML output (vendored in `third_party/uplot/`)
 - **gzip/pigz** — runtime dependency for `.vcd.gz` decompression (pigz preferred when available)
 
 ## Project Structure
 
-- `src/main.rs` — entire application (parser, profiler, HTML generator)
+- `src/main.cpp` — entire application (parser, profiler, HTML generator)
 - `doc/architecture.md` — design spec and feature requirements
-- `third_party/` — vendored crates and uPlot assets (fully offline build)
+- `third_party/` — vendored dependencies and assets (fully offline build)
 - `vcd-samples/` — test VCD files at various scales
-- `target/` — Cargo build directory (gitignored)
+- `build/` — CMake build directory (gitignored)
 - `output/` — default output directory (gitignored)
 
 ## Architecture & Design Constraints

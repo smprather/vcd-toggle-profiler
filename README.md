@@ -30,25 +30,14 @@ windows — all in a single offline HTML file powered by
 - **Downsampling** — large traces are downsampled to `--max-points` for fast
   rendering while preserving peaks on the rate series. Consecutive points with
   unchanged y-values are deduplicated before downsampling.
-- **Fully offline** — all Rust crates (including `clap`) and uPlot assets are
-  vendored in-repo. No network access is required to build or run.
+- **Fully offline** — third-party dependencies are vendored in-repo. No network
+  access is required to build or run.
 - **Gzip support** — reads `.vcd.gz` files transparently (pipes through `gzip -d`).
 - **Stdin support** — pass `-` as the input to read from a pipe.
 
 ## Build
 
-### Rust (primary)
-
-Requirements: Rust toolchain (`cargo`) and `gzip` on `$PATH` for `.gz`
-input (`pigz` is used when available).
-
-```bash
-cargo build --release
-```
-
-The binary is written to `./target/release/vcd-toggle-profiler`.
-
-### C++ (alternative)
+### C++
 
 Requirements: a C++17 compiler, CMake >= 3.16, and `gzip` on `$PATH` for `.gz`
 input (`pigz` is used when available). Release builds enable `-march=native`,
@@ -76,10 +65,10 @@ ctest --test-dir build --output-on-failure
 
 ```bash
 # Basic run — writes report to output/toggle_profile.html
-./target/release/vcd-toggle-profiler vcd-samples/random/random.vcd
+./build/vcd-toggle-profiler vcd-samples/random/random.vcd
 
 # Custom window, step, time range, and output directory
-./target/release/vcd-toggle-profiler vcd-samples/swerv/swerv1.vcd \
+./build/vcd-toggle-profiler vcd-samples/swerv/swerv1.vcd \
   --outdir swerv-out \
   --win-size 500ps \
   --step-size 50ps \
@@ -88,10 +77,10 @@ ctest --test-dir build --output-on-failure
   --rate-unit ns
 
 # Gzipped input
-./target/release/vcd-toggle-profiler vcd-samples/Briey/dump1.vcd.gz
+./build/vcd-toggle-profiler vcd-samples/Briey/dump1.vcd.gz
 
 # Pipe from another tool
-zcat huge.vcd.gz | ./target/release/vcd-toggle-profiler - --title "Huge design"
+zcat huge.vcd.gz | ./build/vcd-toggle-profiler - --title "Huge design"
 ```
 
 ## Benchmark Quick Check
@@ -99,13 +88,11 @@ zcat huge.vcd.gz | ./target/release/vcd-toggle-profiler - --title "Huge design"
 Use the helper scripts in repo root:
 
 ```bash
-hyperfine --warmup 1 --max-runs 3 ./run_rust
 hyperfine --warmup 1 --max-runs 3 ./run_cpp
 ```
 
 Current reference run (Briey sample, `--max-points 0 --win-size 10ns --step-size 1ns`):
 
-- `run_rust`: ~3.15s mean
 - `run_cpp`: ~2.98s mean
 
 Recent C++ speedups were focused on minimizing parser-loop allocations and reducing
@@ -193,8 +180,6 @@ The `vcd-samples/` directory contains test data at various scales:
 All third-party code is checked into the repository so the project builds
 fully offline:
 
-- **[clap](https://github.com/clap-rs/clap)** — vendored Rust CLI dependency in
-  `third_party/cargo-vendor/` (wired via `.cargo/config.toml`)
 - **[uPlot](https://github.com/leeoniya/uPlot)** v1.6.16 — `third_party/uplot/`
 - **[CLI11](https://github.com/CLIUtils/CLI11)** — `third_party/CLI11/` (C++ build only)
 - **[GoogleTest](https://github.com/google/googletest)** — `third_party/googletest/` (C++ tests)
