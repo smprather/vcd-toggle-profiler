@@ -61,6 +61,17 @@ cmake --build build -j$(nproc)
 
 The binary is written to `./build/vcd-toggle-profiler`.
 
+### C++ tests (optional)
+
+GoogleTest is vendored in-repo (`third_party/googletest`) and can be enabled
+without network access:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVCD_TOGGLE_PROFILER_BUILD_TESTS=ON
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure
+```
+
 ## Quick start
 
 ```bash
@@ -186,6 +197,7 @@ fully offline:
   `third_party/cargo-vendor/` (wired via `.cargo/config.toml`)
 - **[uPlot](https://github.com/leeoniya/uPlot)** v1.6.16 — `third_party/uplot/`
 - **[CLI11](https://github.com/CLIUtils/CLI11)** — `third_party/CLI11/` (C++ build only)
+- **[GoogleTest](https://github.com/google/googletest)** — `third_party/googletest/` (C++ tests)
 
 ## License
 
