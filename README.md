@@ -30,7 +30,7 @@ windows — all in a single offline HTML file powered by
 - **Downsampling** — large traces are downsampled to `--max-points` for fast
   rendering while preserving peaks on the rate series. Consecutive points with
   unchanged y-values are deduplicated before downsampling.
-- **Fully offline** — no third-party Rust crates are required; uPlot assets are
+- **Fully offline** — all Rust crates (including `clap`) and uPlot assets are
   vendored in-repo. No network access is required to build or run.
 - **Gzip support** — reads `.vcd.gz` files transparently (pipes through `gzip -d`).
 - **Stdin support** — pass `-` as the input to read from a pipe.
@@ -179,6 +179,8 @@ The `vcd-samples/` directory contains test data at various scales:
 All third-party code is checked into the repository so the project builds
 fully offline:
 
+- **[clap](https://github.com/clap-rs/clap)** — vendored Rust CLI dependency in
+  `third_party/cargo-vendor/` (wired via `.cargo/config.toml`)
 - **[uPlot](https://github.com/leeoniya/uPlot)** v1.6.16 — `third_party/uplot/`
 - **[CLI11](https://github.com/CLIUtils/CLI11)** — `third_party/CLI11/` (C++ build only)
 

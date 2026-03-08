@@ -3,6 +3,9 @@ name = "vcd-toggle-profiler"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+clap = { version = "4.5.31", features = ["derive"] }
+
 [profile.release]
 lto = true
 codegen-units = 1

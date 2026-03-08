@@ -1,11 +1,12 @@
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
+
+use clap::Parser;
 
 #[derive(Clone, Debug)]
 struct Options {
@@ -58,6 +59,116 @@ impl Default for Options {
             uplot_css_path: String::new(),
         }
     }
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "vcd-toggle-profiler")]
+#[command(
+    about = "Profiles VCD signal toggles over time with a sliding window and generates an offline static HTML report with embedded uPlot, plus signal/toggle summary files."
+)]
+struct CliArgs {
+    #[arg(
+        value_name = "input",
+        help = "Input path (.vcd, .vcd.gz, or - for stdin)"
+    )]
+    input_path: String,
+
+    #[arg(
+        long,
+        value_name = "dir",
+        default_value = "output",
+        help = "Output directory"
+    )]
+    outdir: String,
+
+    #[arg(
+        long = "win-size",
+        value_name = "dur",
+        default_value = "500ps",
+        help = "Sliding window size"
+    )]
+    win_size: String,
+
+    #[arg(
+        long = "step-size",
+        value_name = "dur",
+        default_value = "50ps",
+        help = "Step size"
+    )]
+    step_size: String,
+
+    #[arg(
+        long = "start-time",
+        value_name = "dur",
+        help = "Start time for plotted/selected windows (snapped down to a step boundary)"
+    )]
+    start_time: Option<String>,
+
+    #[arg(
+        long = "stop-time",
+        value_name = "dur",
+        help = "Stop time for plotted/selected windows"
+    )]
+    stop_time: Option<String>,
+
+    #[arg(
+        long = "rate-unit",
+        value_name = "unit",
+        default_value = "ns",
+        help = "Rate unit: fs/ps/ns/us/ms/s"
+    )]
+    rate_unit: String,
+
+    #[arg(
+        long,
+        value_name = "prefix",
+        help = "Case-sensitive FQSN prefix filter"
+    )]
+    preamble: Option<String>,
+
+    #[arg(
+        long = "allow-top-window-overlap",
+        value_name = "true|false",
+        default_value = "false",
+        help = "Allow overlap among selected top windows"
+    )]
+    allow_top_window_overlap: String,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Write debug CSV with time(<x_unit>),toggle_rate(toggles/<rate_unit>),cumulative_toggle_count"
+    )]
+    debug: bool,
+
+    #[arg(
+        long,
+        value_name = "text",
+        help = "Report title (default: input basename)"
+    )]
+    title: Option<String>,
+
+    #[arg(
+        long = "max-points",
+        value_name = "n",
+        default_value_t = 200_000u64,
+        help = "Max rendered plot points (0 disables downsampling)"
+    )]
+    max_points: u64,
+
+    #[arg(
+        long = "uplot-js",
+        value_name = "path",
+        help = "Override uPlot JS asset path"
+    )]
+    uplot_js_path: Option<String>,
+
+    #[arg(
+        long = "uplot-css",
+        value_name = "path",
+        help = "Override uPlot CSS asset path"
+    )]
+    uplot_css_path: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -144,11 +255,6 @@ impl InputHandle {
 
         Ok(())
     }
-}
-
-enum ParseOutcome {
-    Help,
-    Run(Options),
 }
 
 #[derive(Clone)]
@@ -507,6 +613,7 @@ struct StepAccumulator {
     step_fs: u64,
     window_delta: FastMap<u64, i64>,
     cumulative_start_delta: FastMap<u64, u64>,
+    max_step: u64,
     total_toggles: u64,
 }
 
@@ -517,6 +624,7 @@ impl StepAccumulator {
             step_fs,
             window_delta: FastMap::default(),
             cumulative_start_delta: FastMap::default(),
+            max_step: 0,
             total_toggles: 0,
         }
     }
@@ -537,9 +645,15 @@ impl StepAccumulator {
             if n_hi != u64::MAX {
                 add_signed_delta(&mut self.window_delta, n_hi + 1, -(toggles as i64));
             }
+            if n_hi > self.max_step {
+                self.max_step = n_hi;
+            }
         }
 
         add_unsigned_delta(&mut self.cumulative_start_delta, n_lo, toggles);
+        if n_lo > self.max_step {
+            self.max_step = n_lo;
+        }
 
         self.total_toggles = self.total_toggles.saturating_add(toggles);
     }
@@ -556,27 +670,20 @@ impl StepAccumulator {
         window_deltas.sort_unstable_by_key(|x| x.0);
         cumulative_deltas.sort_unstable_by_key(|x| x.0);
 
-        // Sparse iteration: only visit steps where a delta exists.
-        // Memory is O(number of value-change events), not O(trace_duration / step_size).
-        let mut steps: Vec<u64> =
-            Vec::with_capacity(window_deltas.len() + cumulative_deltas.len());
-        for &(k, _) in &window_deltas {
-            steps.push(k);
-        }
-        for &(k, _) in &cumulative_deltas {
-            steps.push(k);
-        }
-        steps.sort_unstable();
-        steps.dedup();
-
-        let mut out = Vec::with_capacity(steps.len());
+        let mut out = Vec::new();
+        out.reserve((self.max_step as usize).saturating_add(1));
 
         let mut wi = 0usize;
         let mut ci = 0usize;
         let mut running_window: i64 = 0;
         let mut running_cumulative: u64 = 0;
 
-        for &step in &steps {
+        let mut step = 0u64;
+        loop {
+            if step > self.max_step {
+                break;
+            }
+
             while wi < window_deltas.len() && window_deltas[wi].0 == step {
                 running_window += window_deltas[wi].1;
                 wi += 1;
@@ -615,6 +722,11 @@ impl StepAccumulator {
                 cumulative_toggles: running_cumulative,
                 rate,
             });
+
+            if step == u64::MAX {
+                break;
+            }
+            step += 1;
         }
 
         out
@@ -1771,134 +1883,46 @@ fn open_input(opts: &Options) -> Result<InputHandle, String> {
     })
 }
 
-fn print_help(program: &str) {
-    println!("Profiles VCD signal toggles over time with a sliding window and generates an offline static HTML report with embedded uPlot, plus signal/toggle summary files.\n");
-    println!("{} [OPTIONS] input\n", program);
-    println!("POSITIONALS:");
-    println!("  input                       Input path (.vcd, .vcd.gz, or - for stdin)\n");
-    println!("OPTIONS:");
-    println!("  -h, --help                 Print this help message and exit");
-    println!("      --outdir <dir>         Output directory [default: output]");
-    println!("      --win-size <dur>       Sliding window size [default: 500ps]");
-    println!("      --step-size <dur>      Step size [default: 50ps]");
-    println!("      --start-time <dur>     Start time for plotted/selected windows (snapped down to a step boundary)");
-    println!("      --stop-time <dur>      Stop time for plotted/selected windows");
-    println!("      --rate-unit <unit>     Rate unit: fs/ps/ns/us/ms/s [default: ns]");
-    println!("      --preamble <prefix>    Case-sensitive FQSN prefix filter");
-    println!("      --allow-top-window-overlap <true|false>  Allow overlap among selected top windows [default: false]");
-    println!("      --debug                Write debug CSV with time(<x_unit>),toggle_rate(toggles/<rate_unit>),cumulative_toggle_count");
-    println!("      --title <text>         Report title (default: input basename)");
-    println!("      --max-points <n>       Max rendered plot points (0 disables downsampling) [default: 200000]");
-    println!("      --uplot-js <path>      Override uPlot JS asset path");
-    println!("      --uplot-css <path>     Override uPlot CSS asset path");
-}
+fn parse_options() -> Result<Options, String> {
+    let cli = CliArgs::parse();
+    let mut opts = Options {
+        input_path: cli.input_path,
+        outdir: cli.outdir,
+        preamble: cli.preamble.unwrap_or_default(),
+        debug: cli.debug,
+        max_points: cli.max_points,
+        uplot_js_path: cli.uplot_js_path.unwrap_or_default(),
+        uplot_css_path: cli.uplot_css_path.unwrap_or_default(),
+        ..Options::default()
+    };
 
-fn parse_options() -> Result<ParseOutcome, String> {
-    let mut opts = Options::default();
+    opts.win_fs =
+        parse_duration_to_fs(&cli.win_size, false).map_err(|e| format!("--win-size {}", e))?;
+    opts.step_fs =
+        parse_duration_to_fs(&cli.step_size, false).map_err(|e| format!("--step-size {}", e))?;
 
-    let argv: Vec<String> = env::args().collect();
-    let program = argv
-        .first()
-        .map(|s| {
-            Path::new(s)
-                .file_name()
-                .map(|x| x.to_string_lossy().to_string())
-                .unwrap_or_else(|| s.clone())
-        })
-        .unwrap_or_else(|| "vcd-toggle-profiler".to_string());
+    opts.rate_unit_fs = parse_unit_fs(&cli.rate_unit)
+        .ok_or_else(|| "--rate-unit must be one of fs/ps/ns/us/ms/s".to_string())?;
+    opts.rate_unit_label = cli.rate_unit.to_ascii_lowercase();
 
-    let mut i = 1usize;
-    while i < argv.len() {
-        let arg = &argv[i];
+    opts.allow_top_window_overlap = parse_bool(&cli.allow_top_window_overlap)
+        .ok_or_else(|| "--allow-top-window-overlap must be true or false".to_string())?;
 
-        if arg == "-h" || arg == "--help" {
-            print_help(&program);
-            return Ok(ParseOutcome::Help);
-        }
-
-        if arg.starts_with("--") {
-            let take_value =
-                |idx: &mut usize, argv: &[String], name: &str| -> Result<String, String> {
-                    *idx += 1;
-                    if *idx >= argv.len() {
-                        return Err(format!("missing value for {}", name));
-                    }
-                    Ok(argv[*idx].clone())
-                };
-
-            match arg.as_str() {
-                "--outdir" => opts.outdir = take_value(&mut i, &argv, "--outdir")?,
-                "--win-size" => {
-                    let v = take_value(&mut i, &argv, "--win-size")?;
-                    opts.win_fs =
-                        parse_duration_to_fs(&v, false).map_err(|e| format!("--win-size {}", e))?;
-                }
-                "--step-size" => {
-                    let v = take_value(&mut i, &argv, "--step-size")?;
-                    opts.step_fs = parse_duration_to_fs(&v, false)
-                        .map_err(|e| format!("--step-size {}", e))?;
-                }
-                "--start-time" => {
-                    let v = take_value(&mut i, &argv, "--start-time")?;
-                    opts.start_fs = parse_duration_to_fs(&v, true)
-                        .map_err(|e| format!("--start-time {}", e))?;
-                    opts.has_start_time = true;
-                }
-                "--stop-time" => {
-                    let v = take_value(&mut i, &argv, "--stop-time")?;
-                    opts.stop_fs =
-                        parse_duration_to_fs(&v, true).map_err(|e| format!("--stop-time {}", e))?;
-                    opts.has_stop_time = true;
-                }
-                "--rate-unit" => {
-                    let v = take_value(&mut i, &argv, "--rate-unit")?;
-                    let unit_fs = parse_unit_fs(&v)
-                        .ok_or_else(|| "--rate-unit must be one of fs/ps/ns/us/ms/s".to_string())?;
-                    opts.rate_unit_fs = unit_fs;
-                    opts.rate_unit_label = v.to_ascii_lowercase();
-                }
-                "--preamble" => opts.preamble = take_value(&mut i, &argv, "--preamble")?,
-                "--allow-top-window-overlap" => {
-                    let v = take_value(&mut i, &argv, "--allow-top-window-overlap")?;
-                    opts.allow_top_window_overlap = parse_bool(&v).ok_or_else(|| {
-                        "--allow-top-window-overlap must be true or false".to_string()
-                    })?;
-                }
-                "--debug" => opts.debug = true,
-                "--title" => {
-                    opts.title = take_value(&mut i, &argv, "--title")?;
-                    opts.title_explicit = true;
-                }
-                "--max-points" => {
-                    let v = take_value(&mut i, &argv, "--max-points")?;
-                    opts.max_points = v
-                        .parse::<u64>()
-                        .map_err(|_| "--max-points must be an unsigned integer".to_string())?;
-                }
-                "--uplot-js" => opts.uplot_js_path = take_value(&mut i, &argv, "--uplot-js")?,
-                "--uplot-css" => opts.uplot_css_path = take_value(&mut i, &argv, "--uplot-css")?,
-                _ => return Err(format!("The following argument was not expected: {}", arg)),
-            }
-
-            i += 1;
-            continue;
-        }
-
-        if arg.starts_with('-') && arg != "-" {
-            return Err(format!("The following argument was not expected: {}", arg));
-        }
-
-        if opts.input_path.is_empty() {
-            opts.input_path = arg.clone();
-        } else {
-            return Err(format!("unexpected positional argument: {}", arg));
-        }
-
-        i += 1;
+    if let Some(title) = cli.title {
+        opts.title = title;
+        opts.title_explicit = true;
     }
 
-    if opts.input_path.is_empty() {
-        return Err("input is required".to_string());
+    if let Some(start_time) = cli.start_time {
+        opts.start_fs =
+            parse_duration_to_fs(&start_time, true).map_err(|e| format!("--start-time {}", e))?;
+        opts.has_start_time = true;
+    }
+
+    if let Some(stop_time) = cli.stop_time {
+        opts.stop_fs =
+            parse_duration_to_fs(&stop_time, true).map_err(|e| format!("--stop-time {}", e))?;
+        opts.has_stop_time = true;
     }
 
     if opts.step_fs > opts.win_fs {
@@ -1923,16 +1947,14 @@ fn parse_options() -> Result<ParseOutcome, String> {
         }
     }
 
-    Ok(ParseOutcome::Run(opts))
+    Ok(opts)
 }
 
 fn main() {
     let mut opts = match parse_options() {
-        Ok(ParseOutcome::Help) => return,
-        Ok(ParseOutcome::Run(opts)) => opts,
+        Ok(opts) => opts,
         Err(e) => {
             eprintln!("{}", e);
-            eprintln!("Run with --help for more information.");
             std::process::exit(1);
         }
     };
@@ -1947,9 +1969,59 @@ fn main() {
     }
 }
 
+struct OutdirCleanupGuard {
+    path: PathBuf,
+    created_this_run: bool,
+    files_written: u64,
+}
+
+impl OutdirCleanupGuard {
+    fn new(path: PathBuf, created_this_run: bool) -> Self {
+        Self {
+            path,
+            created_this_run,
+            files_written: 0,
+        }
+    }
+
+    fn mark_file_written(&mut self) {
+        self.files_written = self.files_written.saturating_add(1);
+    }
+}
+
+impl Drop for OutdirCleanupGuard {
+    fn drop(&mut self) {
+        if !self.created_this_run || self.files_written != 0 {
+            return;
+        }
+
+        let Ok(meta) = fs::metadata(&self.path) else {
+            return;
+        };
+        if !meta.is_dir() {
+            return;
+        }
+
+        let Ok(mut iter) = fs::read_dir(&self.path) else {
+            return;
+        };
+        if iter.next().is_some() {
+            return;
+        }
+
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
 fn run(opts: Options) -> Result<(), String> {
-    fs::create_dir_all(&opts.outdir)
+    let outdir = PathBuf::from(&opts.outdir);
+    let outdir_preexisting = outdir
+        .try_exists()
+        .map_err(|e| format!("failed to inspect output directory '{}': {e}", opts.outdir))?;
+
+    fs::create_dir_all(&outdir)
         .map_err(|e| format!("failed to create output directory '{}': {e}", opts.outdir))?;
+    let mut outdir_guard = OutdirCleanupGuard::new(outdir.clone(), !outdir_preexisting);
 
     let mut input = open_input(&opts)?;
 
@@ -1971,7 +2043,6 @@ fn run(opts: Options) -> Result<(), String> {
     let plot_deduped = dedup_plot_data(&plot_full);
     let plot = downsample_plot_data(&plot_deduped, opts.max_points);
 
-    let outdir = PathBuf::from(&opts.outdir);
     let html_path = outdir.join("toggle_profile.html");
     let signal_list_path = outdir.join("signals.txt");
     let signal_csv_path = outdir.join("signal_toggle_counts.csv");
@@ -1979,10 +2050,14 @@ fn run(opts: Options) -> Result<(), String> {
     let debug_csv_path = outdir.join("debug.csv");
 
     write_signal_list(&signal_list_path, &parser.signals)?;
+    outdir_guard.mark_file_written();
     write_signal_csv(&signal_csv_path, &parser.signals)?;
+    outdir_guard.mark_file_written();
     write_top_windows(&top_windows_path, &top_windows)?;
+    outdir_guard.mark_file_written();
     if opts.debug {
         write_debug_csv(&debug_csv_path, &plot, &opts)?;
+        outdir_guard.mark_file_written();
     }
 
     let js_path = resolve_asset_path(&opts.uplot_js_path, "third_party/uplot/uPlot.iife.js")
@@ -2009,6 +2084,7 @@ fn run(opts: Options) -> Result<(), String> {
         &uplot_js,
         &uplot_css,
     )?;
+    outdir_guard.mark_file_written();
 
     println!("Input: {}", opts.input_path);
     println!("Outdir: {}", outdir.display());

@@ -41,6 +41,7 @@ cargo build --release
 
 - **Rust** — implementation (`src/main.rs`)
 - **Cargo** — build system (`Cargo.toml`)
+- **clap** — Rust CLI parser (vendored in `third_party/cargo-vendor/`)
 - **uPlot** v1.6.16 — chart library inlined into HTML output (vendored in `third_party/uplot/`)
 - **gzip/pigz** — runtime dependency for `.vcd.gz` decompression (pigz preferred when available)
 
@@ -48,7 +49,7 @@ cargo build --release
 
 - `src/main.rs` — entire application (parser, profiler, HTML generator)
 - `doc/architecture.md` — design spec and feature requirements
-- `third_party/` — vendored uPlot assets (fully offline build)
+- `third_party/` — vendored crates and uPlot assets (fully offline build)
 - `vcd-samples/` — test VCD files at various scales
 - `target/` — Cargo build directory (gitignored)
 - `output/` — default output directory (gitignored)

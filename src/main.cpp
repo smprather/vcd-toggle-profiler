@@ -1779,9 +1779,30 @@ int main(int argc, char** argv) {
     opts.title = DefaultTitleFromInput(opts.input_path);
   }
 
+  const fs::path outdir_path(opts.outdir);
+  bool created_outdir_this_run = false;
+  uint64_t output_files_written = 0;
+  auto cleanup_empty_outdir_if_needed = [&]() {
+    if (!created_outdir_this_run || output_files_written != 0) {
+      return;
+    }
+
+    std::error_code ec;
+    if (!fs::exists(outdir_path, ec) || ec) {
+      return;
+    }
+    if (!fs::is_directory(outdir_path, ec) || ec) {
+      return;
+    }
+    if (!fs::is_empty(outdir_path, ec) || ec) {
+      return;
+    }
+    fs::remove(outdir_path, ec);
+  };
+
   try {
     std::error_code ec;
-    fs::create_directories(opts.outdir, ec);
+    created_outdir_this_run = fs::create_directories(outdir_path, ec);
     if (ec) {
       throw std::runtime_error("failed to create output directory: " + opts.outdir);
     }
@@ -1815,18 +1836,21 @@ int main(int argc, char** argv) {
     const auto plot_full = BuildPlotData(series);
     const auto plot = DownsamplePlotData(plot_full, opts.max_points);
 
-    const fs::path outdir(opts.outdir);
-    const fs::path html_path = outdir / "toggle_profile.html";
-    const fs::path signal_list_path = outdir / "signals.txt";
-    const fs::path signal_csv_path = outdir / "signal_toggle_counts.csv";
-    const fs::path top_windows_path = outdir / "top_20_windows.txt";
-    const fs::path debug_csv_path = outdir / "debug.csv";
+    const fs::path html_path = outdir_path / "toggle_profile.html";
+    const fs::path signal_list_path = outdir_path / "signals.txt";
+    const fs::path signal_csv_path = outdir_path / "signal_toggle_counts.csv";
+    const fs::path top_windows_path = outdir_path / "top_20_windows.txt";
+    const fs::path debug_csv_path = outdir_path / "debug.csv";
 
     WriteSignalList(signal_list_path, parser.signals());
+    ++output_files_written;
     WriteSignalCsv(signal_csv_path, parser.signals());
+    ++output_files_written;
     WriteTopWindows(top_windows_path, top_windows);
+    ++output_files_written;
     if (opts.debug) {
       WriteDebugCsv(debug_csv_path, plot, opts);
+      ++output_files_written;
     }
 
     const auto js_path = ResolveAssetPath(opts.uplot_js_path, fs::path("third_party/uplot/uPlot.iife.js"));
@@ -1848,9 +1872,10 @@ int main(int argc, char** argv) {
                     top_windows,
                     uplot_js,
                     uplot_css);
+    ++output_files_written;
 
     std::cout << "Input: " << opts.input_path << "\n"
-              << "Outdir: " << outdir.string() << "\n"
+              << "Outdir: " << outdir_path.string() << "\n"
               << "Signals retained: " << parser.signals().size() << "\n"
               << "Alias vars skipped: " << parser.stats().alias_dedup_skipped << "\n"
               << "Total toggles: " << parser.accumulator().total_toggles() << "\n"
@@ -1875,6 +1900,7 @@ int main(int argc, char** argv) {
 
     return 0;
   } catch (const std::exception& ex) {
+    cleanup_empty_outdir_if_needed();
     std::cerr << "error: " << ex.what() << "\n";
     return 1;
   }
