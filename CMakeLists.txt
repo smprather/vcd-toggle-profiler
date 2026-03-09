@@ -40,8 +40,14 @@ if (VCD_TOGGLE_PROFILER_BUILD_TESTS)
 
   add_executable(vcd-toggle-profiler-tests
     tests/smoke_test.cpp
+    tests/integration_test.cpp
   )
   target_link_libraries(vcd-toggle-profiler-tests PRIVATE GTest::gtest_main)
+  target_compile_definitions(vcd-toggle-profiler-tests PRIVATE
+    VCD_PROFILER_BIN="$<TARGET_FILE:vcd-toggle-profiler>"
+    VCD_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+  )
+  add_dependencies(vcd-toggle-profiler-tests vcd-toggle-profiler)
 
   include(GoogleTest)
   gtest_discover_tests(vcd-toggle-profiler-tests)
